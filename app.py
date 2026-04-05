@@ -2,9 +2,21 @@ import streamlit as st
 import requests
 import pandas as pd
 
-st.set_page_config(page_title="單股交易員版", layout="centered")
+st.set_page_config(page_title="單股投顧交易系統", layout="centered")
 
 FUGLE_BASE_URL = "https://api.fugle.tw/marketdata/v1.0/stock"
+
+# =========================
+# 工具函式
+# =========================
+def fmt_num(x, digits=2):
+    try:
+        return f"{float(x):.{digits}f}"
+    except:
+        return "-"
+
+def safe_text(x):
+    return str(x).strip() if x is not None else ""
 
 # =========================
 # 盤後：FinMind 日K
@@ -16,7 +28,6 @@ def fetch_daily_data(stock_id, start_date="2023-01-01"):
         "data_id": stock_id,
         "start_date": start_date
     }
-
     try:
         res = requests.get(url, params=params, timeout=20).json()
     except Exception:
@@ -107,42 +118,43 @@ def backtest_strategy(df):
         "trades": len(returns)
     }
 
-def forecast_tomorrow(score_value, win_rate):
-    if score_value >= 80 and win_rate >= 55:
-        return 55, 30, 15, "偏多，可列優先觀察"
-    elif score_value >= 70 and win_rate >= 50:
-        return 45, 35, 20, "偏多，但仍需盤中突破確認"
-    elif score_value >= 50:
-        return 30, 40, 30, "中性，僅觀察"
+def build_after_decision(score, win_rate, avg_return, close_price, pressure, support, cost=None, direction="多"):
+    if direction == "多":
+        if win_rate >= 55 and avg_return > 0 and score >= 70:
+            action = "偏多"
+        elif win_rate >= 50 and score >= 60:
+            action = "續抱"
+        elif score >= 50:
+            action = "偏保守"
+        else:
+            action = "汰弱"
+
+        stop_loss = round(min(support, close_price * 0.985), 2)
+
+        pressure1 = round(pressure, 2)
+        pressure2 = round(pressure * 1.03, 2)
+        support1 = round(support, 2)
+
     else:
-        return 15, 35, 50, "偏弱，不建議主動出手"
+        if win_rate >= 55 and avg_return < 0 and score <= 40:
+            action = "偏空"
+        elif score <= 50:
+            action = "反彈調節"
+        else:
+            action = "偏保守"
 
-def build_after_decision(score, win_rate, avg_return):
-    risks = []
+        pressure1 = round(pressure, 2)
+        pressure2 = round(pressure * 1.02, 2)
+        support1 = round(support, 2)
+        stop_loss = round(pressure * 1.015, 2)
 
-    if win_rate < 40:
-        risks.append("勝率偏低")
-    if avg_return < 0:
-        risks.append("平均報酬為負")
-    if score < 50:
-        risks.append("今日結構偏弱")
-
-    if win_rate >= 55 and avg_return > 0 and score >= 70:
-        decision = "可做：可列入明日重點觀察"
-        level = "A級"
-    elif win_rate >= 50 and avg_return >= 0 and score >= 60:
-        decision = "可觀察：需盤中突破確認後再考慮"
-        level = "B級"
-    else:
-        decision = "不建議做：盤後條件不足"
-        level = "C級"
-
-    if not risks:
-        risks_text = "低風險結構，仍需盤中確認"
-    else:
-        risks_text = "、".join(risks)
-
-    return decision, level, risks_text
+    return {
+        "action": action,
+        "pressure1": pressure1,
+        "pressure2": pressure2,
+        "support1": support1,
+        "stop_loss": stop_loss
+    }
 
 def analyze_after_stock(stock_id):
     df = fetch_daily_data(stock_id)
@@ -159,13 +171,14 @@ def analyze_after_stock(stock_id):
     trades = bt["trades"]
 
     t = df.iloc[-1]
+    p = df.iloc[-2]
 
-    pressure = round(float(t["max"]), 2)
-    support = round(float(t["min"]), 2)
-    close = round(float(t["close"]), 2)
-
-    up_prob, side_prob, down_prob, comment = forecast_tomorrow(score_value, win_rate)
-    decision, level, risks_text = build_after_decision(score_value, win_rate, avg_return)
+    close_price = round(float(t["close"]), 2)
+    open_price = round(float(t["open"]), 2)
+    high_price = round(float(t["max"]), 2)
+    low_price = round(float(t["min"]), 2)
+    volume_now = int(t["Trading_Volume"])
+    volume_prev = int(p["Trading_Volume"])
 
     return {
         "stock": stock_id,
@@ -173,16 +186,12 @@ def analyze_after_stock(stock_id):
         "win_rate": win_rate,
         "avg_return": avg_return,
         "trades": trades,
-        "close": close,
-        "pressure": pressure,
-        "support": support,
-        "up_prob": up_prob,
-        "side_prob": side_prob,
-        "down_prob": down_prob,
-        "comment": comment,
-        "decision": decision,
-        "level": level,
-        "risks_text": risks_text
+        "close": close_price,
+        "open": open_price,
+        "high": high_price,
+        "low": low_price,
+        "vol_now": volume_now,
+        "vol_prev": volume_prev
     }
 
 # =========================
@@ -199,213 +208,318 @@ def fugle_quote(symbol, api_key):
     except Exception:
         return None
 
-def build_trade_plan(pressure, support):
-    risk = round(max(pressure - support, 0.01), 2)
+def build_intraday_plan(price, open_price, high, low, ref_price, pressure, support, direction="多"):
+    if direction == "多":
+        breakout = price > pressure
+        fake_break = high > pressure and price < pressure
+        strong = price >= open_price and price >= ref_price
+        chase_limit = round(pressure * 1.01, 2)
+        stop_loss = round(max(support, pressure * 0.995), 2)
+        tp1 = round(pressure + (pressure - support) * 0.5, 2)
+        tp2 = round(pressure + (pressure - support) * 1.0, 2)
 
-    entry_trigger = round(pressure, 2)
-    chase_limit = round(pressure * 1.01, 2)
-    stop_loss = round(max(support, pressure * 0.995), 2)
+        if breakout and strong and price <= chase_limit:
+            action = "偏多"
+            comment = "股價已有效突破盤後壓力區，短線可依紀律偏多操作。"
+        elif breakout and price > chase_limit:
+            action = "偏保守"
+            comment = "股價雖已突破，但短線乖離偏大，不宜追價，宜待拉回確認。"
+        elif fake_break:
+            action = "反彈調節"
+            comment = "盤中一度越過壓力後又回落，屬假突破型態，宜保守應對。"
+        else:
+            action = "偏保守"
+            comment = "尚未形成有效突破，建議持續觀察，不宜提前追價。"
 
-    tp1 = round(pressure + risk * 0.5, 2)
-    tp2 = round(pressure + risk * 1.0, 2)
+    else:
+        breakout = price < support
+        fake_break = low < support and price > support
+        strong = price <= open_price and price <= ref_price
+        chase_limit = round(support * 0.99, 2)
+        stop_loss = round(pressure * 1.015, 2)
+        tp1 = round(support - (pressure - support) * 0.5, 2)
+        tp2 = round(support - (pressure - support) * 1.0, 2)
+
+        if breakout and strong and price >= chase_limit:
+            action = "偏空"
+            comment = "股價已跌破盤後支撐區，空方延續力道具備，可依紀律偏空操作。"
+        elif fake_break:
+            action = "偏保守"
+            comment = "跌破後迅速站回支撐，屬假跌破，空方追擊風險偏高。"
+        else:
+            action = "反彈調節"
+            comment = "尚未形成明確空方破位訊號，建議以反彈調節與觀察為主。"
 
     return {
-        "entry_trigger": entry_trigger,
-        "chase_limit": chase_limit,
+        "action": action,
+        "comment": comment,
         "stop_loss": stop_loss,
         "tp1": tp1,
-        "tp2": tp2,
-        "risk": risk
-    }
-
-def build_intraday_decision(price, entry_trigger, chase_limit, stop_loss, high_price, pressure):
-    risks = []
-
-    breakout = price > entry_trigger
-    fake_break = high_price > pressure and price < pressure
-    over_chase = price > chase_limit
-    broken_stop = price < stop_loss
-
-    if fake_break:
-        risks.append("假突破風險")
-    if over_chase:
-        risks.append("追價過遠")
-    if broken_stop:
-        risks.append("跌破停損區")
-
-    if breakout and (not fake_break) and (not over_chase) and (not broken_stop):
-        decision = "可做：已形成有效進場條件"
-        level = "A級"
-    elif breakout and over_chase and (not fake_break):
-        decision = "可觀察：已突破但不宜追價"
-        level = "B級"
-    else:
-        decision = "不建議做：尚未形成安全進場條件"
-        level = "C級"
-
-    if not risks:
-        risks_text = "目前無明顯結構風險"
-    else:
-        risks_text = "、".join(risks)
-
-    return decision, level, risks_text
-
-def analyze_intraday(symbol, pressure, support, api_key):
-    data = fugle_quote(symbol, api_key)
-
-    if not data or "lastPrice" not in data:
-        return {"symbol": symbol, "error": "抓不到盤中資料，請確認 API Key、股票代號，或目前是否有行情"}
-
-    price = data.get("lastPrice", 0)
-    high = data.get("highPrice", 0)
-    low = data.get("lowPrice", 0)
-    open_price = data.get("openPrice", 0)
-    ref_price = data.get("referencePrice", 0)
-    avg_price = data.get("avgPrice", 0)
-    change_percent = data.get("changePercent", 0)
-
-    plan = build_trade_plan(pressure, support)
-    decision, level, risks_text = build_intraday_decision(
-        price=price,
-        entry_trigger=plan["entry_trigger"],
-        chase_limit=plan["chase_limit"],
-        stop_loss=plan["stop_loss"],
-        high_price=high,
-        pressure=pressure
-    )
-
-    if price >= plan["tp2"]:
-        status = "已達第二停利區"
-    elif price >= plan["tp1"]:
-        status = "已達第一停利區"
-    elif price <= plan["stop_loss"]:
-        status = "已跌破停損參考"
-    else:
-        status = "尚在策略區間內"
-
-    return {
-        "symbol": symbol,
-        "price": price,
-        "open_price": open_price,
-        "high": high,
-        "low": low,
-        "ref_price": ref_price,
-        "avg_price": avg_price,
-        "change_percent": change_percent,
-        "pressure": pressure,
-        "support": support,
-        "entry_trigger": plan["entry_trigger"],
-        "chase_limit": plan["chase_limit"],
-        "stop_loss": plan["stop_loss"],
-        "tp1": plan["tp1"],
-        "tp2": plan["tp2"],
-        "level": level,
-        "result": decision,
-        "status": status,
-        "risks_text": risks_text
+        "tp2": tp2
     }
 
 # =========================
-# Session State
+# 投顧格式文字
+# =========================
+def build_fundamental_summary(note_text):
+    note_text = safe_text(note_text)
+    if note_text:
+        return f"基本面摘要：\n依據提供之資料，{note_text}。整體仍應搭配後續營收、題材延續性與市場資金偏好同步追蹤。"
+    return "基本面摘要：\n未提供營收、成長率或產業題材補充資料，故本段僅保留中性描述，不額外推導未提供之基本面資訊。"
+
+def build_after_speech(stock_id, stock_name, market, cost, direction, note_text, res, plan):
+    name_show = stock_name if stock_name else "未填名稱"
+    market_show = market if market else "未填市場"
+    cost_text = safe_text(cost) if safe_text(cost) else "未填成本"
+
+    tech_text = (
+        f"技術面與籌碼面重點：\n"
+        f"今日收盤 {fmt_num(res['close'])}，日內高低區間為 {fmt_num(res['low'])} 至 {fmt_num(res['high'])}。"
+        f"今日評分 {res['score']} 分，歷史勝率 {res['win_rate']}%，平均報酬 {res['avg_return']}%，樣本筆數 {res['trades']}。"
+        f"若以量能觀察，今日成交量與前一日相比 {'放大' if res['vol_now'] > res['vol_prev'] else '未明顯放大'}，"
+        f"現階段壓力區以 {fmt_num(plan['pressure1'])} 為主，支撐區先看 {fmt_num(plan['support1'])}。"
+    )
+
+    if direction == "多":
+        op_text = (
+            f"操作建議：\n"
+            f"操作方向：{plan['action']}\n"
+            f"壓力價：{fmt_num(plan['pressure1'])} / {fmt_num(plan['pressure2'])}\n"
+            f"支撐價：{fmt_num(plan['support1'])}\n"
+            f"停損價：{fmt_num(plan['stop_loss'])}\n"
+            f"建議說明：若後續能帶量突破壓力區，短線結構才有機會轉強；若跌破停損價，則原先多方假設失效，宜嚴守紀律。"
+        )
+    else:
+        op_text = (
+            f"操作建議：\n"
+            f"操作方向：{plan['action']}\n"
+            f"壓力價：{fmt_num(plan['pressure1'])} / {fmt_num(plan['pressure2'])}\n"
+            f"支撐價：{fmt_num(plan['support1'])}\n"
+            f"停損價：{fmt_num(plan['stop_loss'])}\n"
+            f"建議說明：反彈至壓力區若無法突破，仍可視為空方觀察區；若上破停損價，則空方假設失效，宜立即修正。"
+        )
+
+    return (
+        f"{stock_id} {name_show} {market_show} {cost_text} {direction}\n\n"
+        f"{build_fundamental_summary(note_text)}\n\n"
+        f"{tech_text}\n\n"
+        f"{op_text}"
+    )
+
+def build_intraday_speech(stock_id, stock_name, market, cost, direction, note_text, quote, pressure, support, plan):
+    name_show = stock_name if stock_name else "未填名稱"
+    market_show = market if market else "未填市場"
+    cost_text = safe_text(cost) if safe_text(cost) else "未填成本"
+
+    basic = build_fundamental_summary(note_text)
+
+    tech_text = (
+        f"技術面與籌碼面重點：\n"
+        f"盤中現價 {fmt_num(quote['lastPrice'])}，開盤 {fmt_num(quote['openPrice'])}，"
+        f"盤中高低為 {fmt_num(quote['lowPrice'])} 至 {fmt_num(quote['highPrice'])}，"
+        f"參考價 {fmt_num(quote['referencePrice'])}，漲跌幅 {fmt_num(quote['changePercent'])}%。"
+        f"目前盤後帶入壓力位 {fmt_num(pressure)}，支撐位 {fmt_num(support)}。"
+    )
+
+    if direction == "多":
+        op_text = (
+            f"操作建議：\n"
+            f"操作方向：{plan['action']}\n"
+            f"壓力價：{fmt_num(pressure)} / {fmt_num(pressure * 1.02)}\n"
+            f"支撐價：{fmt_num(support)}\n"
+            f"停損價：{fmt_num(plan['stop_loss'])}\n"
+            f"建議說明：{plan['comment']} 第一停利可參考 {fmt_num(plan['tp1'])}，第二停利可參考 {fmt_num(plan['tp2'])}。"
+        )
+    else:
+        op_text = (
+            f"操作建議：\n"
+            f"操作方向：{plan['action']}\n"
+            f"壓力價：{fmt_num(pressure)} / {fmt_num(pressure * 1.02)}\n"
+            f"支撐價：{fmt_num(support)}\n"
+            f"停損價：{fmt_num(plan['stop_loss'])}\n"
+            f"建議說明：{plan['comment']} 第一回補區可參考 {fmt_num(plan['tp1'])}，第二回補區可參考 {fmt_num(plan['tp2'])}。"
+        )
+
+    return (
+        f"{stock_id} {name_show} {market_show} {cost_text} {direction}\n\n"
+        f"{basic}\n\n"
+        f"{tech_text}\n\n"
+        f"{op_text}"
+    )
+
+# =========================
+# Session
 # =========================
 if "after_result" not in st.session_state:
     st.session_state.after_result = None
+if "stock_name" not in st.session_state:
+    st.session_state.stock_name = ""
+if "market" not in st.session_state:
+    st.session_state.market = "台股"
+if "cost" not in st.session_state:
+    st.session_state.cost = ""
+if "direction" not in st.session_state:
+    st.session_state.direction = "多"
+if "note_text" not in st.session_state:
+    st.session_state.note_text = ""
 
 # =========================
-# UI：雙頁籤
+# UI
 # =========================
 tab1, tab2 = st.tabs(["盤後分析", "盤中判斷"])
 
 with tab1:
-    st.title("單股盤後交易員版")
-    st.caption("收盤後使用：專注 1 檔股票，給出壓力、支撐與隔日觀察方向")
+    st.title("單股盤後投顧版")
+    st.caption("收盤後使用：輸入單一標的，系統自動整理盤後觀察重點與操作建議")
 
     with st.form("after_form"):
-        stock = st.text_input("股票代號", value="4906").strip()
+        c1, c2 = st.columns(2)
+        stock_id = c1.text_input("股票代號", value="4906").strip()
+        stock_name = c2.text_input("股票名稱", value=st.session_state.stock_name).strip()
+
+        c3, c4 = st.columns(2)
+        market = c3.text_input("市場別", value=st.session_state.market).strip()
+        direction = c4.selectbox("操作方向", ["多", "空"], index=0 if st.session_state.direction == "多" else 1)
+
+        cost = st.text_input("買進或放空成本", value=st.session_state.cost)
+        note_text = st.text_area("基本面摘要補充", value=st.session_state.note_text, placeholder="例如：3月營收年增、伺服器題材、AI需求回溫")
+
         submitted_after = st.form_submit_button("開始分析")
 
     if submitted_after:
-        res = analyze_after_stock(stock)
+        st.session_state.stock_name = stock_name
+        st.session_state.market = market
+        st.session_state.cost = cost
+        st.session_state.direction = direction
+        st.session_state.note_text = note_text
+
+        res = analyze_after_stock(stock_id)
 
         if "error" in res:
             st.error(res["error"])
         else:
-            st.session_state.after_result = res
+            plan = build_after_decision(
+                score=res["score"],
+                win_rate=res["win_rate"],
+                avg_return=res["avg_return"],
+                close_price=res["close"],
+                pressure=res["high"],
+                support=res["low"],
+                cost=cost,
+                direction=direction
+            )
+
+            st.session_state.after_result = {
+                "stock": stock_id,
+                "stock_name": stock_name,
+                "market": market,
+                "cost": cost,
+                "direction": direction,
+                "note_text": note_text,
+                "res": res,
+                "plan": plan
+            }
 
             st.subheader("盤後結果")
-            st.write(f"股票：{res['stock']}")
-            st.write(f"等級：{res['level']}")
+            st.write(f"股票：{stock_id}")
+            st.write(f"等級：{plan['action']}")
             st.write(f"今日評分：{res['score']}")
             st.write(f"歷史勝率：{res['win_rate']}%")
             st.write(f"平均報酬：{res['avg_return']}%")
             st.write(f"樣本筆數：{res['trades']}")
 
-            st.write("可不可以做：")
-            st.write(res["decision"])
+            st.write("操作重點：")
+            st.write(f"壓力：{fmt_num(plan['pressure1'])} / {fmt_num(plan['pressure2'])}")
+            st.write(f"支撐：{fmt_num(plan['support1'])}")
+            st.write(f"停損：{fmt_num(plan['stop_loss'])}")
 
-            st.write("風險標記：")
-            st.write(res["risks_text"])
+            speech = build_after_speech(
+                stock_id=stock_id,
+                stock_name=stock_name,
+                market=market,
+                cost=cost,
+                direction=direction,
+                note_text=note_text,
+                res=res,
+                plan=plan
+            )
 
-            st.write("明日走勢機率：")
-            st.write(f"上攻：{res['up_prob']}%")
-            st.write(f"震盪：{res['side_prob']}%")
-            st.write(f"下跌：{res['down_prob']}%")
-
-            st.write("關鍵價位：")
-            st.write(f"今日收盤：{res['close']}")
-            st.write(f"明日壓力：{res['pressure']}")
-            st.write(f"明日支撐：{res['support']}")
-
-            st.write("盤後建議：")
-            st.write(res["comment"])
+            st.subheader("投顧老師操作建議")
+            st.text_area("可直接複製使用", value=speech, height=420)
 
 with tab2:
-    st.title("單股盤中交易員版")
-    st.caption("盤中使用：依盤後帶入的壓力與支撐，判斷是否可進場與如何出場")
+    st.title("單股盤中投顧版")
+    st.caption("盤中使用：依盤後帶入壓力與支撐，自動給出盤中操作判斷")
 
-    after_result = st.session_state.after_result
+    after_data = st.session_state.after_result
+    default_stock = after_data["stock"] if after_data else "4906"
+    default_name = after_data["stock_name"] if after_data else ""
+    default_market = after_data["market"] if after_data else "台股"
+    default_cost = after_data["cost"] if after_data else ""
+    default_direction = after_data["direction"] if after_data else "多"
+    default_note = after_data["note_text"] if after_data else ""
+    default_pressure = float(after_data["plan"]["pressure1"]) if after_data else 42.0
+    default_support = float(after_data["plan"]["support1"]) if after_data else 39.0
 
-    default_stock = after_result["stock"] if after_result else "4906"
-    default_pressure = float(after_result["pressure"]) if after_result else 40.0
-    default_support = float(after_result["support"]) if after_result else 39.0
-
-    with st.form("intraday_form"):
-        api_key = st.text_input("Fugle API Key", value="")
+    with st.form("intra_form"):
+        api_key = st.text_input("Fugle API Key", value="", type="password")
         stock_i = st.text_input("股票代號", value=default_stock).strip()
+
+        c5, c6 = st.columns(2)
+        stock_name_i = c5.text_input("股票名稱", value=default_name).strip()
+        market_i = c6.text_input("市場別", value=default_market).strip()
+
+        c7, c8 = st.columns(2)
+        cost_i = c7.text_input("買進或放空成本", value=default_cost)
+        direction_i = c8.selectbox("操作方向", ["多", "空"], index=0 if default_direction == "多" else 1)
+
         pressure_i = st.number_input("壓力", value=default_pressure, step=0.1, format="%.2f")
         support_i = st.number_input("支撐", value=default_support, step=0.1, format="%.2f")
+        note_i = st.text_area("基本面摘要補充", value=default_note)
 
         submitted_intra = st.form_submit_button("更新盤中判斷")
 
     if submitted_intra:
-        res = analyze_intraday(stock_i, pressure_i, support_i, api_key)
+        data = fugle_quote(stock_i, api_key)
 
-        if "error" in res:
-            st.error(res["error"])
+        if not data:
+            st.error("抓不到盤中資料，請確認 API Key、股票代號，或目前是否有行情")
         else:
+            plan = build_intraday_plan(
+                price=float(data.get("lastPrice", 0) or 0),
+                open_price=float(data.get("openPrice", 0) or 0),
+                high=float(data.get("highPrice", 0) or 0),
+                low=float(data.get("lowPrice", 0) or 0),
+                ref_price=float(data.get("referencePrice", 0) or 0),
+                pressure=float(pressure_i),
+                support=float(support_i),
+                direction=direction_i
+            )
+
             st.subheader("盤中結果")
-            st.write(f"股票：{res['symbol']}")
-            st.write(f"等級：{res['level']}")
-            st.write(f"現價：{res['price']}")
-            st.write(f"開盤：{res['open_price']}")
-            st.write(f"今高：{res['high']}")
-            st.write(f"今低：{res['low']}")
-            st.write(f"參考價：{res['ref_price']}")
-            st.write(f"均價：{res['avg_price']}")
-            st.write(f"漲跌幅：{res['change_percent']}%")
+            st.write(f"股票：{stock_i}")
+            st.write(f"操作方向：{plan['action']}")
+            st.write(f"現價：{fmt_num(data.get('lastPrice', 0))}")
+            st.write(f"開盤：{fmt_num(data.get('openPrice', 0))}")
+            st.write(f"高點：{fmt_num(data.get('highPrice', 0))}")
+            st.write(f"低點：{fmt_num(data.get('lowPrice', 0))}")
+            st.write(f"漲跌幅：{fmt_num(data.get('changePercent', 0))}%")
+            st.write(f"停損：{fmt_num(plan['stop_loss'])}")
+            st.write(f"第一目標：{fmt_num(plan['tp1'])}")
+            st.write(f"第二目標：{fmt_num(plan['tp2'])}")
 
-            st.write("進出場策略：")
-            st.write(f"進場觸發：突破 {res['entry_trigger']}")
-            st.write(f"不追價上限：{res['chase_limit']}")
-            st.write(f"停損參考：{res['stop_loss']}")
-            st.write(f"第一停利：{res['tp1']}")
-            st.write(f"第二停利：{res['tp2']}")
+            speech = build_intraday_speech(
+                stock_id=stock_i,
+                stock_name=stock_name_i,
+                market=market_i,
+                cost=cost_i,
+                direction=direction_i,
+                note_text=note_i,
+                quote=data,
+                pressure=pressure_i,
+                support=support_i,
+                plan=plan
+            )
 
-            st.write("可不可以做：")
-            st.write(res["result"])
-
-            st.write("風險標記：")
-            st.write(res["risks_text"])
-
-            st.write("目前狀態：")
-            st.write(res["status"])
+            st.subheader("投顧老師操作建議")
+            st.text_area("可直接複製使用", value=speech, height=420)
