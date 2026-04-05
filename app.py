@@ -2,9 +2,10 @@ import streamlit as st
 import requests
 import pandas as pd
 
-st.set_page_config(page_title="單股投顧交易系統", layout="centered")
+st.set_page_config(page_title="單股盤後盤中分析系統", layout="centered")
 
 FUGLE_BASE_URL = "https://api.fugle.tw/marketdata/v1.0/stock"
+FINMIND_BASE_URL = "https://api.finmindtrade.com/api/v4/data"
 
 # =========================
 # 工具函式
@@ -12,31 +13,130 @@ FUGLE_BASE_URL = "https://api.fugle.tw/marketdata/v1.0/stock"
 def fmt_num(x, digits=2):
     try:
         return f"{float(x):.{digits}f}"
-    except:
+    except Exception:
         return "-"
 
 def safe_text(x):
     return str(x).strip() if x is not None else ""
 
+def volume_to_human(v):
+    try:
+        v = float(v)
+    except Exception:
+        return "-"
+    if v >= 100000000:
+        return f"{v/100000000:.2f}億"
+    if v >= 10000:
+        return f"{v/10000:.2f}萬"
+    return f"{int(v)}"
+
 # =========================
-# 盤後：FinMind 日K
+# FinMind：快取資料
 # =========================
-def fetch_daily_data(stock_id, start_date="2023-01-01"):
-    url = "https://api.finmindtrade.com/api/v4/data"
+@st.cache_data(ttl=3600)
+def fetch_finmind_dataset(dataset, data_id="", start_date="2023-01-01"):
     params = {
-        "dataset": "TaiwanStockPrice",
-        "data_id": stock_id,
+        "dataset": dataset,
         "start_date": start_date
     }
+    if data_id:
+        params["data_id"] = data_id
+
     try:
-        res = requests.get(url, params=params, timeout=20).json()
+        res = requests.get(FINMIND_BASE_URL, params=params, timeout=20).json()
     except Exception:
         return None
 
-    if "data" not in res or len(res["data"]) < 40:
+    if "data" not in res:
         return None
 
-    df = pd.DataFrame(res["data"]).sort_values("date").reset_index(drop=True)
+    return pd.DataFrame(res["data"])
+
+@st.cache_data(ttl=3600)
+def fetch_stock_info(stock_id):
+    df = fetch_finmind_dataset("TaiwanStockInfo", start_date="2000-01-01")
+    if df is None or df.empty:
+        return None
+
+    if "stock_id" not in df.columns:
+        return None
+
+    target = df[df["stock_id"].astype(str) == str(stock_id)]
+    if target.empty:
+        return None
+
+    row = target.iloc[0]
+    return {
+        "stock_id": str(row.get("stock_id", "")),
+        "stock_name": str(row.get("stock_name", "")),
+        "industry_category": str(row.get("industry_category", "")),
+        "type": str(row.get("type", ""))
+    }
+
+@st.cache_data(ttl=3600)
+def fetch_month_revenue(stock_id):
+    df = fetch_finmind_dataset("TaiwanStockMonthRevenue", data_id=stock_id, start_date="2023-01-01")
+    if df is None or df.empty:
+        return None
+
+    sort_cols = [c for c in ["revenue_year", "revenue_month"] if c in df.columns]
+    if sort_cols:
+        df = df.sort_values(sort_cols).reset_index(drop=True)
+
+    latest = df.iloc[-1].to_dict()
+    prev = df.iloc[-2].to_dict() if len(df) >= 2 else None
+    return latest, prev
+
+def build_auto_fundamental_summary(stock_id):
+    info = fetch_stock_info(stock_id)
+    rev_data = fetch_month_revenue(stock_id)
+
+    parts = []
+
+    if info:
+        name = info.get("stock_name", "")
+        industry = info.get("industry_category", "")
+        if name and industry:
+            parts.append(f"{name}所屬產業類別為{industry}")
+        elif name:
+            parts.append(f"{name}為目前查得之公司名稱")
+
+    if rev_data:
+        latest, prev = rev_data
+        y = latest.get("revenue_year", "")
+        m = latest.get("revenue_month", "")
+        revenue = latest.get("revenue", None)
+
+        if y and m and revenue is not None:
+            parts.append(f"最新月營收資料為{y}年{m}月，單月營收約{volume_to_human(revenue)}元")
+
+        if prev and latest.get("revenue", None) is not None and prev.get("revenue", None) is not None:
+            try:
+                mom = (float(latest["revenue"]) - float(prev["revenue"])) / float(prev["revenue"]) * 100
+                if mom > 0:
+                    parts.append(f"月營收較前一期增加約{mom:.2f}%")
+                elif mom < 0:
+                    parts.append(f"月營收較前一期減少約{abs(mom):.2f}%")
+                else:
+                    parts.append("月營收與前一期大致持平")
+            except Exception:
+                pass
+
+    if not parts:
+        return "未成功抓取最新公開基本面資料，建議後續補充月營收或產業題材後再行比對。"
+
+    return "；".join(parts) + "。"
+
+# =========================
+# 盤後：日K資料
+# =========================
+@st.cache_data(ttl=3600)
+def fetch_daily_data(stock_id, start_date="2023-01-01"):
+    df = fetch_finmind_dataset("TaiwanStockPrice", data_id=stock_id, start_date=start_date)
+    if df is None or df.empty or len(df) < 40:
+        return None
+
+    df = df.sort_values("date").reset_index(drop=True)
     return df
 
 def valid_row(row):
@@ -118,7 +218,7 @@ def backtest_strategy(df):
         "trades": len(returns)
     }
 
-def build_after_decision(score, win_rate, avg_return, close_price, pressure, support, cost=None, direction="多"):
+def build_after_decision(score, win_rate, avg_return, close_price, pressure, support, direction="多"):
     if direction == "多":
         if win_rate >= 55 and avg_return > 0 and score >= 70:
             action = "偏多"
@@ -130,7 +230,6 @@ def build_after_decision(score, win_rate, avg_return, close_price, pressure, sup
             action = "汰弱"
 
         stop_loss = round(min(support, close_price * 0.985), 2)
-
         pressure1 = round(pressure, 2)
         pressure2 = round(pressure * 1.03, 2)
         support1 = round(support, 2)
@@ -173,29 +272,22 @@ def analyze_after_stock(stock_id):
     t = df.iloc[-1]
     p = df.iloc[-2]
 
-    close_price = round(float(t["close"]), 2)
-    open_price = round(float(t["open"]), 2)
-    high_price = round(float(t["max"]), 2)
-    low_price = round(float(t["min"]), 2)
-    volume_now = int(t["Trading_Volume"])
-    volume_prev = int(p["Trading_Volume"])
-
     return {
         "stock": stock_id,
         "score": score_value,
         "win_rate": win_rate,
         "avg_return": avg_return,
         "trades": trades,
-        "close": close_price,
-        "open": open_price,
-        "high": high_price,
-        "low": low_price,
-        "vol_now": volume_now,
-        "vol_prev": volume_prev
+        "close": round(float(t["close"]), 2),
+        "open": round(float(t["open"]), 2),
+        "high": round(float(t["max"]), 2),
+        "low": round(float(t["min"]), 2),
+        "vol_now": int(t["Trading_Volume"]),
+        "vol_prev": int(p["Trading_Volume"])
     }
 
 # =========================
-# 盤中：Fugle 即時報價
+# 盤中：Fugle即時報價
 # =========================
 def fugle_quote(symbol, api_key):
     headers = {"X-API-KEY": api_key}
@@ -259,15 +351,9 @@ def build_intraday_plan(price, open_price, high, low, ref_price, pressure, suppo
     }
 
 # =========================
-# 投顧格式文字
+# 輸出文字
 # =========================
-def build_fundamental_summary(note_text):
-    note_text = safe_text(note_text)
-    if note_text:
-        return f"基本面摘要：\n依據提供之資料，{note_text}。整體仍應搭配後續營收、題材延續性與市場資金偏好同步追蹤。"
-    return "基本面摘要：\n未提供營收、成長率或產業題材補充資料，故本段僅保留中性描述，不額外推導未提供之基本面資訊。"
-
-def build_after_speech(stock_id, stock_name, market, cost, direction, note_text, res, plan):
+def build_after_speech(stock_id, stock_name, market, cost, direction, auto_fundamental, res, plan):
     name_show = stock_name if stock_name else "未填名稱"
     market_show = market if market else "未填市場"
     cost_text = safe_text(cost) if safe_text(cost) else "未填成本"
@@ -276,8 +362,8 @@ def build_after_speech(stock_id, stock_name, market, cost, direction, note_text,
         f"技術面與籌碼面重點：\n"
         f"今日收盤 {fmt_num(res['close'])}，日內高低區間為 {fmt_num(res['low'])} 至 {fmt_num(res['high'])}。"
         f"今日評分 {res['score']} 分，歷史勝率 {res['win_rate']}%，平均報酬 {res['avg_return']}%，樣本筆數 {res['trades']}。"
-        f"若以量能觀察，今日成交量與前一日相比 {'放大' if res['vol_now'] > res['vol_prev'] else '未明顯放大'}，"
-        f"現階段壓力區以 {fmt_num(plan['pressure1'])} 為主，支撐區先看 {fmt_num(plan['support1'])}。"
+        f"若以成交量觀察，今日成交量與前一日相比 {'放大' if res['vol_now'] > res['vol_prev'] else '未明顯放大'}，"
+        f"現階段壓力區先看 {fmt_num(plan['pressure1'])}，支撐區先看 {fmt_num(plan['support1'])}。"
     )
 
     if direction == "多":
@@ -301,23 +387,21 @@ def build_after_speech(stock_id, stock_name, market, cost, direction, note_text,
 
     return (
         f"{stock_id} {name_show} {market_show} {cost_text} {direction}\n\n"
-        f"{build_fundamental_summary(note_text)}\n\n"
+        f"基本面摘要：\n{auto_fundamental}\n\n"
         f"{tech_text}\n\n"
         f"{op_text}"
     )
 
-def build_intraday_speech(stock_id, stock_name, market, cost, direction, note_text, quote, pressure, support, plan):
+def build_intraday_speech(stock_id, stock_name, market, cost, direction, auto_fundamental, quote, pressure, support, plan):
     name_show = stock_name if stock_name else "未填名稱"
     market_show = market if market else "未填市場"
     cost_text = safe_text(cost) if safe_text(cost) else "未填成本"
 
-    basic = build_fundamental_summary(note_text)
-
     tech_text = (
         f"技術面與籌碼面重點：\n"
-        f"盤中現價 {fmt_num(quote['lastPrice'])}，開盤 {fmt_num(quote['openPrice'])}，"
-        f"盤中高低為 {fmt_num(quote['lowPrice'])} 至 {fmt_num(quote['highPrice'])}，"
-        f"參考價 {fmt_num(quote['referencePrice'])}，漲跌幅 {fmt_num(quote['changePercent'])}%。"
+        f"盤中現價 {fmt_num(quote.get('lastPrice', 0))}，開盤 {fmt_num(quote.get('openPrice', 0))}，"
+        f"盤中高低為 {fmt_num(quote.get('lowPrice', 0))} 至 {fmt_num(quote.get('highPrice', 0))}，"
+        f"參考價 {fmt_num(quote.get('referencePrice', 0))}，漲跌幅 {fmt_num(quote.get('changePercent', 0))}%。"
         f"目前盤後帶入壓力位 {fmt_num(pressure)}，支撐位 {fmt_num(support)}。"
     )
 
@@ -342,7 +426,7 @@ def build_intraday_speech(stock_id, stock_name, market, cost, direction, note_te
 
     return (
         f"{stock_id} {name_show} {market_show} {cost_text} {direction}\n\n"
-        f"{basic}\n\n"
+        f"基本面摘要：\n{auto_fundamental}\n\n"
         f"{tech_text}\n\n"
         f"{op_text}"
     )
@@ -352,16 +436,6 @@ def build_intraday_speech(stock_id, stock_name, market, cost, direction, note_te
 # =========================
 if "after_result" not in st.session_state:
     st.session_state.after_result = None
-if "stock_name" not in st.session_state:
-    st.session_state.stock_name = ""
-if "market" not in st.session_state:
-    st.session_state.market = "台股"
-if "cost" not in st.session_state:
-    st.session_state.cost = ""
-if "direction" not in st.session_state:
-    st.session_state.direction = "多"
-if "note_text" not in st.session_state:
-    st.session_state.note_text = ""
 
 # =========================
 # UI
@@ -370,29 +444,17 @@ tab1, tab2 = st.tabs(["盤後分析", "盤中判斷"])
 
 with tab1:
     st.title("單股盤後投顧版")
-    st.caption("收盤後使用：輸入單一標的，系統自動整理盤後觀察重點與操作建議")
+    st.caption("收盤後使用：輸入單一標的，系統自動抓取最新公開基本面資料並整理盤後觀察重點")
 
     with st.form("after_form"):
-        c1, c2 = st.columns(2)
-        stock_id = c1.text_input("股票代號", value="4906").strip()
-        stock_name = c2.text_input("股票名稱", value=st.session_state.stock_name).strip()
-
-        c3, c4 = st.columns(2)
-        market = c3.text_input("市場別", value=st.session_state.market).strip()
-        direction = c4.selectbox("操作方向", ["多", "空"], index=0 if st.session_state.direction == "多" else 1)
-
-        cost = st.text_input("買進或放空成本", value=st.session_state.cost)
-        note_text = st.text_area("基本面摘要補充", value=st.session_state.note_text, placeholder="例如：3月營收年增、伺服器題材、AI需求回溫")
-
+        stock_id = st.text_input("股票代號", value="4906").strip()
+        stock_name = st.text_input("股票名稱", value="").strip()
+        market = st.text_input("市場別", value="台股").strip()
+        direction = st.selectbox("操作方向", ["多", "空"])
+        cost = st.text_input("買進或放空成本", value="")
         submitted_after = st.form_submit_button("開始分析")
 
     if submitted_after:
-        st.session_state.stock_name = stock_name
-        st.session_state.market = market
-        st.session_state.cost = cost
-        st.session_state.direction = direction
-        st.session_state.note_text = note_text
-
         res = analyze_after_stock(stock_id)
 
         if "error" in res:
@@ -405,9 +467,10 @@ with tab1:
                 close_price=res["close"],
                 pressure=res["high"],
                 support=res["low"],
-                cost=cost,
                 direction=direction
             )
+
+            auto_fundamental = build_auto_fundamental_summary(stock_id)
 
             st.session_state.after_result = {
                 "stock": stock_id,
@@ -415,9 +478,9 @@ with tab1:
                 "market": market,
                 "cost": cost,
                 "direction": direction,
-                "note_text": note_text,
                 "res": res,
-                "plan": plan
+                "plan": plan,
+                "auto_fundamental": auto_fundamental
             }
 
             st.subheader("盤後結果")
@@ -439,17 +502,17 @@ with tab1:
                 market=market,
                 cost=cost,
                 direction=direction,
-                note_text=note_text,
+                auto_fundamental=auto_fundamental,
                 res=res,
                 plan=plan
             )
 
-            st.subheader("投顧老師操作建議")
+            st.subheader("操作建議")
             st.text_area("可直接複製使用", value=speech, height=420)
 
 with tab2:
     st.title("單股盤中投顧版")
-    st.caption("盤中使用：依盤後帶入壓力與支撐，自動給出盤中操作判斷")
+    st.caption("盤中使用：依盤後壓力與支撐搭配即時報價，自動給出盤中操作判斷")
 
     after_data = st.session_state.after_result
     default_stock = after_data["stock"] if after_data else "4906"
@@ -457,26 +520,19 @@ with tab2:
     default_market = after_data["market"] if after_data else "台股"
     default_cost = after_data["cost"] if after_data else ""
     default_direction = after_data["direction"] if after_data else "多"
-    default_note = after_data["note_text"] if after_data else ""
     default_pressure = float(after_data["plan"]["pressure1"]) if after_data else 42.0
     default_support = float(after_data["plan"]["support1"]) if after_data else 39.0
+    default_fundamental = after_data["auto_fundamental"] if after_data else build_auto_fundamental_summary(default_stock)
 
     with st.form("intra_form"):
         api_key = st.text_input("Fugle API Key", value="", type="password")
         stock_i = st.text_input("股票代號", value=default_stock).strip()
-
-        c5, c6 = st.columns(2)
-        stock_name_i = c5.text_input("股票名稱", value=default_name).strip()
-        market_i = c6.text_input("市場別", value=default_market).strip()
-
-        c7, c8 = st.columns(2)
-        cost_i = c7.text_input("買進或放空成本", value=default_cost)
-        direction_i = c8.selectbox("操作方向", ["多", "空"], index=0 if default_direction == "多" else 1)
-
+        stock_name_i = st.text_input("股票名稱", value=default_name).strip()
+        market_i = st.text_input("市場別", value=default_market).strip()
+        cost_i = st.text_input("買進或放空成本", value=default_cost)
+        direction_i = st.selectbox("操作方向", ["多", "空"], index=0 if default_direction == "多" else 1)
         pressure_i = st.number_input("壓力", value=default_pressure, step=0.1, format="%.2f")
         support_i = st.number_input("支撐", value=default_support, step=0.1, format="%.2f")
-        note_i = st.text_area("基本面摘要補充", value=default_note)
-
         submitted_intra = st.form_submit_button("更新盤中判斷")
 
     if submitted_intra:
@@ -514,12 +570,12 @@ with tab2:
                 market=market_i,
                 cost=cost_i,
                 direction=direction_i,
-                note_text=note_i,
+                auto_fundamental=default_fundamental,
                 quote=data,
                 pressure=pressure_i,
                 support=support_i,
                 plan=plan
             )
 
-            st.subheader("投顧老師操作建議")
+            st.subheader("操作建議")
             st.text_area("可直接複製使用", value=speech, height=420)
