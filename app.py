@@ -250,22 +250,64 @@ def map_us_indices(industry_category: str):
         return ["^DJI"], "道瓊"
     return ["^IXIC"], "那指"
 
-@st.cache_data(ttl=3600)
-def fetch_us_index_change(ticker):
-    try:
-        df = yf.download(ticker, period="7d", interval="1d", progress=False, auto_adjust=False)
-    except Exception:
+def _normalize_close_series(df):
+    if df is None or len(df) == 0:
         return None
 
-    if df is None or df.empty or "Close" not in df.columns or len(df) < 2:
+    # 一般情況：單層欄位
+    if "Close" in df.columns:
+        close_obj = df["Close"]
+    else:
+        close_obj = None
+        # 多層欄位時，找最後一層名為 Close 的欄
+        if isinstance(df.columns, pd.MultiIndex):
+            for col in df.columns:
+                if str(col[-1]) == "Close":
+                    close_obj = df[col]
+                    break
+
+    if close_obj is None:
         return None
 
-    close_series = df["Close"].dropna()
+    # 若還是 DataFrame，取第一欄
+    if isinstance(close_obj, pd.DataFrame):
+        if close_obj.shape[1] == 0:
+            return None
+        close_obj = close_obj.iloc[:, 0]
+
+    close_series = pd.to_numeric(close_obj, errors="coerce").dropna()
     if len(close_series) < 2:
         return None
 
-    latest = float(close_series.iloc[-1])
-    prev = float(close_series.iloc[-2])
+    return close_series
+
+@st.cache_data(ttl=3600)
+def fetch_us_index_change(ticker):
+    try:
+        df = yf.download(
+            ticker,
+            period="7d",
+            interval="1d",
+            progress=False,
+            auto_adjust=False,
+            group_by="column"
+        )
+    except Exception:
+        return None
+
+    close_series = _normalize_close_series(df)
+    if close_series is None:
+        return None
+
+    try:
+        latest = float(close_series.iloc[-1])
+        prev = float(close_series.iloc[-2])
+    except Exception:
+        return None
+
+    if prev == 0:
+        return None
+
     pct = (latest - prev) / prev * 100
     return {
         "ticker": ticker,
@@ -328,7 +370,6 @@ def fetch_400_holder_ratio(stock_id):
     df = df.copy()
     df[level_col] = df[level_col].astype(str)
 
-    # 400張以上
     df_400 = df[df[level_col].str.contains("400", na=False)].copy()
     if df_400.empty:
         return None
@@ -504,7 +545,7 @@ def detect_stage_advanced(df, stock_id):
         return {
             "stage": "-",
             "stage_name": "資料不足",
-            "stage_desc": "資料不足，無法進行階段判斷。",
+            "stage_desc": f"資料不足，無法進行階段判斷。(更新時間: {now_hhmm()})",
             "favorable_zone": "未知",
             "chip_warning": False,
             "chip_message": f"無法判斷籌碼變化。(更新時間: {now_hhmm()})"
@@ -525,7 +566,8 @@ def detect_stage_advanced(df, stock_id):
     pos20 = (close_now - low20) / (high20 - low20 + 1e-6)
 
     ret5 = (close_now - float(d.iloc[-6]["close"])) / float(d.iloc[-6]["close"]) * 100 if len(d) >= 6 else 0
-    vol_ratio = float(t["Trading_Volume"]) / float(d["Trading_Volume"].rolling(5).mean().iloc[-1]) if pd.notna(d["Trading_Volume"].rolling(5).mean().iloc[-1]) else 1
+    vol_ma5 = d["Trading_Volume"].rolling(5).mean().iloc[-1]
+    vol_ratio = float(t["Trading_Volume"]) / float(vol_ma5) if pd.notna(vol_ma5) and vol_ma5 != 0 else 1
     breakout = close_now >= float(d["max"].iloc[-10:-1].max())
 
     ma_bull = (
