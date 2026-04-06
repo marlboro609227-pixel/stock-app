@@ -2,6 +2,7 @@ import streamlit as st
 import requests
 import pandas as pd
 import yfinance as yf
+import numpy as np
 
 from datetime import datetime, timedelta, timezone
 
@@ -23,13 +24,25 @@ def now_hhmm():
 
 def fmt_num(x, digits=2):
     try:
+        if pd.isna(x):
+            return "-"
         return f"{float(x):.{digits}f}"
     except Exception:
         return "-"
 
 def safe_float(x, default=0.0):
     try:
-        return float(x)
+        v = float(x)
+        if pd.isna(v):
+            return default
+        return v
+    except Exception:
+        return default
+
+def safe_int(x, default=0):
+    try:
+        v = int(float(x))
+        return v
     except Exception:
         return default
 
@@ -43,6 +56,15 @@ def volume_to_human(v):
     if v >= 10000:
         return f"{v/10000:.2f}萬"
     return f"{int(v)}"
+
+def is_us_symbol(symbol: str) -> bool:
+    s = (symbol or "").strip().upper()
+    if not s:
+        return False
+    return s.isalpha()
+
+def market_label(symbol: str) -> str:
+    return "美股" if is_us_symbol(symbol) else "台股"
 
 
 # =========================
@@ -182,17 +204,31 @@ def fetch_finmind_dataset(dataset, data_id="", start_date="2023-01-01"):
         params["data_id"] = data_id
 
     try:
-        res = requests.get(FINMIND_BASE_URL, params=params, timeout=20).json()
+        res = requests.get(FINMIND_BASE_URL, params=params, timeout=20)
+        res.raise_for_status()
+        payload = res.json()
     except Exception:
         return None
 
-    if "data" not in res:
+    if "data" not in payload:
         return None
 
-    return pd.DataFrame(res["data"])
+    return pd.DataFrame(payload["data"])
 
+
+# =========================
+# 台股資料
+# =========================
 @st.cache_data(ttl=3600)
 def fetch_stock_info(stock_id):
+    if is_us_symbol(stock_id):
+        return {
+            "stock_id": stock_id.upper(),
+            "stock_name": stock_id.upper(),
+            "industry_category": "美股",
+            "type": "US"
+        }
+
     df = fetch_finmind_dataset("TaiwanStockInfo", start_date="2000-01-01")
     if df is None or df.empty or "stock_id" not in df.columns:
         return None
@@ -211,6 +247,9 @@ def fetch_stock_info(stock_id):
 
 @st.cache_data(ttl=3600)
 def fetch_month_revenue(stock_id):
+    if is_us_symbol(stock_id):
+        return None
+
     df = fetch_finmind_dataset("TaiwanStockMonthRevenue", data_id=stock_id, start_date="2023-01-01")
     if df is None or df.empty:
         return None
@@ -223,13 +262,124 @@ def fetch_month_revenue(stock_id):
     prev = df.iloc[-2].to_dict() if len(df) >= 2 else None
     return latest, prev
 
+
+# =========================
+# 價格資料：台股 / 美股雙市場
+# =========================
+def _normalize_yfinance_close(df):
+    if df is None or len(df) == 0:
+        return None
+
+    if "Close" in df.columns:
+        close_obj = df["Close"]
+    else:
+        close_obj = None
+        if isinstance(df.columns, pd.MultiIndex):
+            for col in df.columns:
+                if str(col[-1]) == "Close":
+                    close_obj = df[col]
+                    break
+
+    if close_obj is None:
+        return None
+
+    if isinstance(close_obj, pd.DataFrame):
+        if close_obj.shape[1] == 0:
+            return None
+        close_obj = close_obj.iloc[:, 0]
+
+    close_series = pd.to_numeric(close_obj, errors="coerce").dropna()
+    if len(close_series) < 2:
+        return None
+
+    return close_series
+
+@st.cache_data(ttl=1800)
+def fetch_us_daily_data(symbol, period="6mo"):
+    try:
+        df = yf.download(
+            symbol.upper(),
+            period=period,
+            interval="1d",
+            progress=False,
+            auto_adjust=False,
+            group_by="column"
+        )
+    except Exception:
+        return None
+
+    if df is None or df.empty:
+        return None
+
+    # 處理多層欄位
+    if isinstance(df.columns, pd.MultiIndex):
+        new_df = pd.DataFrame()
+        for field, target_name in [
+            ("Open", "open"),
+            ("Close", "close"),
+            ("High", "max"),
+            ("Low", "min"),
+            ("Volume", "Trading_Volume")
+        ]:
+            try:
+                obj = df[field]
+                if isinstance(obj, pd.DataFrame):
+                    new_df[target_name] = pd.to_numeric(obj.iloc[:, 0], errors="coerce")
+                else:
+                    new_df[target_name] = pd.to_numeric(obj, errors="coerce")
+            except Exception:
+                return None
+        new_df["date"] = df.index
+        df2 = new_df.copy()
+    else:
+        rename_map = {
+            "Open": "open",
+            "Close": "close",
+            "High": "max",
+            "Low": "min",
+            "Volume": "Trading_Volume"
+        }
+        missing = [k for k in rename_map if k not in df.columns]
+        if missing:
+            return None
+        df2 = df.rename(columns=rename_map).reset_index()
+        if "Date" in df2.columns:
+            df2 = df2.rename(columns={"Date": "date"})
+
+    required = ["date", "open", "close", "max", "min", "Trading_Volume"]
+    for c in required:
+        if c not in df2.columns:
+            return None
+
+    for c in ["open", "close", "max", "min", "Trading_Volume"]:
+        df2[c] = pd.to_numeric(df2[c], errors="coerce")
+
+    df2 = df2.dropna(subset=["open", "close", "max", "min", "Trading_Volume"]).reset_index(drop=True)
+    if len(df2) < 40:
+        return None
+    return df2
+
 @st.cache_data(ttl=3600)
 def fetch_daily_data(stock_id, start_date="2023-01-01"):
+    if is_us_symbol(stock_id):
+        return fetch_us_daily_data(stock_id, period="6mo")
+
     df = fetch_finmind_dataset("TaiwanStockPrice", data_id=stock_id, start_date=start_date)
     if df is None or df.empty or len(df) < 40:
         return None
 
+    required = ["date", "open", "close", "max", "min", "Trading_Volume"]
+    for c in required:
+        if c not in df.columns:
+            return None
+
     df = df.sort_values("date").reset_index(drop=True)
+    for c in ["open", "close", "max", "min", "Trading_Volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    df = df.dropna(subset=["open", "close", "max", "min", "Trading_Volume"]).reset_index(drop=True)
+    if len(df) < 40:
+        return None
     return df
 
 
@@ -237,6 +387,11 @@ def fetch_daily_data(stock_id, start_date="2023-01-01"):
 # 基本面摘要
 # =========================
 def build_auto_fundamental_summary(stock_id):
+    if is_us_symbol(stock_id):
+        info = fetch_stock_info(stock_id)
+        name = info.get("stock_name", stock_id.upper()) if info else stock_id.upper()
+        return f"{name}目前以美股價格與技術結構為主進行判讀，基本面摘要建議搭配公司財報、指引與產業趨勢另行交叉比對。(更新時間: {now_hhmm()})"
+
     info = fetch_stock_info(stock_id)
     rev_data = fetch_month_revenue(stock_id)
 
@@ -278,47 +433,22 @@ def build_auto_fundamental_summary(stock_id):
 
 
 # =========================
-# 美股連動
+# 美股連動 / 美股偏向
 # =========================
 def map_us_indices(industry_category: str):
     text = (industry_category or "").strip()
 
     semi_keywords = ["半導體", "電子", "通訊"]
     cyc_keywords = ["金融", "鋼鐵", "塑膠", "水泥"]
+    growth_keywords = ["AI", "雲端", "軟體", "生技", "醫療", "網通"]
 
     if any(k in text for k in semi_keywords):
         return ["^SOX", "^IXIC"], "費半 / 那指"
     if any(k in text for k in cyc_keywords):
         return ["^DJI"], "道瓊"
+    if any(k in text for k in growth_keywords):
+        return ["^IXIC"], "那指"
     return ["^IXIC"], "那指"
-
-def _normalize_close_series(df):
-    if df is None or len(df) == 0:
-        return None
-
-    if "Close" in df.columns:
-        close_obj = df["Close"]
-    else:
-        close_obj = None
-        if isinstance(df.columns, pd.MultiIndex):
-            for col in df.columns:
-                if str(col[-1]) == "Close":
-                    close_obj = df[col]
-                    break
-
-    if close_obj is None:
-        return None
-
-    if isinstance(close_obj, pd.DataFrame):
-        if close_obj.shape[1] == 0:
-            return None
-        close_obj = close_obj.iloc[:, 0]
-
-    close_series = pd.to_numeric(close_obj, errors="coerce").dropna()
-    if len(close_series) < 2:
-        return None
-
-    return close_series
 
 @st.cache_data(ttl=3600)
 def fetch_us_index_change(ticker):
@@ -334,7 +464,7 @@ def fetch_us_index_change(ticker):
     except Exception:
         return None
 
-    close_series = _normalize_close_series(df)
+    close_series = _normalize_yfinance_close(df)
     if close_series is None:
         return None
 
@@ -355,10 +485,27 @@ def fetch_us_index_change(ticker):
         "change_pct": round(pct, 2)
     }
 
+def summarize_us_bias(indices):
+    if not indices:
+        return "中性"
+
+    avg_pct = float(np.mean([x["change_pct"] for x in indices]))
+    if avg_pct > 0.8:
+        return "偏多"
+    if avg_pct < -0.8:
+        return "偏空"
+    return "中性"
+
 def build_us_correlation_block(stock_id):
     info = fetch_stock_info(stock_id)
     industry = info["industry_category"] if info else ""
-    tickers, label = map_us_indices(industry)
+
+    # 若本身是美股，則直接以 Nasdaq 與 S&P 作大盤參照
+    if is_us_symbol(stock_id):
+        tickers = ["^IXIC", "^GSPC"]
+        label = "Nasdaq / S&P 500"
+    else:
+        tickers, label = map_us_indices(industry)
 
     data = []
     for t in tickers:
@@ -369,7 +516,8 @@ def build_us_correlation_block(stock_id):
     return {
         "industry": industry,
         "mapping_label": label,
-        "indices": data
+        "indices": data,
+        "bias": summarize_us_bias(data)
     }
 
 
@@ -378,6 +526,9 @@ def build_us_correlation_block(stock_id):
 # =========================
 @st.cache_data(ttl=3600)
 def fetch_400_holder_ratio(stock_id):
+    if is_us_symbol(stock_id):
+        return None
+
     df = fetch_finmind_dataset(
         "TaiwanStockHoldingSharesPer",
         data_id=stock_id,
@@ -408,8 +559,11 @@ def fetch_400_holder_ratio(stock_id):
 
     df = df.copy()
     df[level_col] = df[level_col].astype(str)
+    df[percent_col] = pd.to_numeric(df[percent_col], errors="coerce")
+    df = df.dropna(subset=[percent_col])
 
-    df_400 = df[df[level_col].str.contains("400", na=False)].copy()
+    # 400張以上
+    df_400 = df[df[level_col].str.contains("400|600|800|1000", na=False)].copy()
     if df_400.empty:
         return None
 
@@ -427,6 +581,17 @@ def fetch_400_holder_ratio(stock_id):
     return grouped
 
 def check_400_holder_change(stock_id):
+    if is_us_symbol(stock_id):
+        return {
+            "available": False,
+            "latest_ratio": None,
+            "prev_ratio": None,
+            "change": None,
+            "warning": False,
+            "severity": "none",
+            "message": f"美股不適用400張以上大戶持股統計。(更新時間: {now_hhmm()})"
+        }
+
     df = fetch_400_holder_ratio(stock_id)
     if df is None or len(df) < 2:
         return {
@@ -435,6 +600,7 @@ def check_400_holder_change(stock_id):
             "prev_ratio": None,
             "change": None,
             "warning": False,
+            "severity": "none",
             "message": f"無足夠400張以上大戶持股資料。(更新時間: {now_hhmm()})"
         }
 
@@ -447,11 +613,17 @@ def check_400_holder_change(stock_id):
 
     warning = change < -0.5
 
-    if warning:
-        message = f"400張以上大戶持股比例較上一期下降 {abs(change):.2f}% (更新時間: {now_hhmm()})"
+    if change <= -1.0:
+        severity = "strong"
+        message = f"400張以上大戶持股比例較上一期下降 {abs(change):.2f}% ，屬強警戒區。(更新時間: {now_hhmm()})"
+    elif change < -0.5:
+        severity = "mild"
+        message = f"400張以上大戶持股比例較上一期下降 {abs(change):.2f}% ，屬輕度警戒區。(更新時間: {now_hhmm()})"
     elif change > 0:
+        severity = "positive"
         message = f"400張以上大戶持股比例較上一期增加 {change:.2f}% (更新時間: {now_hhmm()})"
     else:
+        severity = "neutral"
         message = f"400張以上大戶持股比例與上一期大致持平 (更新時間: {now_hhmm()})"
 
     return {
@@ -460,6 +632,7 @@ def check_400_holder_change(stock_id):
         "prev_ratio": round(prev_ratio, 2),
         "change": round(change, 2),
         "warning": warning,
+        "severity": severity,
         "message": message
     }
 
@@ -546,12 +719,23 @@ def backtest_strategy(df):
         "trades": len(returns)
     }
 
-def build_after_levels(close_price, high_price, low_price, direction="多"):
+def build_after_levels(close_price, high_price, low_price, direction="多", stage="③"):
+    range_val = max(high_price - low_price, 0.01)
+
     if direction == "多":
         pressure1 = round(high_price, 2)
-        pressure2 = round(high_price * 1.03, 2)
+        if stage in ["③", "④"]:
+            pressure2 = round(high_price + range_val * 0.8, 2)
+        elif stage == "⑤":
+            pressure2 = round(high_price + range_val * 0.4, 2)
+        else:
+            pressure2 = round(high_price + range_val * 0.25, 2)
         support1 = round(low_price, 2)
-        stop_loss = round(min(low_price, close_price * 0.985), 2)
+
+        if stage == "⑥":
+            stop_loss = round(close_price * 0.99, 2)
+        else:
+            stop_loss = round(min(low_price, close_price * 0.985), 2)
     else:
         pressure1 = round(high_price, 2)
         pressure2 = round(high_price * 1.02, 2)
@@ -576,24 +760,31 @@ def detect_stage_advanced(df, stock_id):
             "stage_name": "資料不足",
             "stage_desc": f"資料不足，無法進行階段判斷。(更新時間: {now_hhmm()})",
             "chip_warning": False,
-            "chip_message": f"無法判斷籌碼變化。(更新時間: {now_hhmm()})"
+            "chip_message": f"無法判斷籌碼變化。(更新時間: {now_hhmm()})",
+            "fake_break": False,
+            "upper_shadow_pct": 0.0
         }
 
     d = df.copy().reset_index(drop=True)
     d["ma5"] = d["close"].rolling(5).mean()
     d["ma10"] = d["close"].rolling(10).mean()
     d["ma20"] = d["close"].rolling(20).mean()
+    d["vol5"] = d["Trading_Volume"].rolling(5).mean()
 
     t = d.iloc[-1]
     prev = d.iloc[-2]
 
     close_now = float(t["close"])
+    open_now = float(t["open"])
+    high_now = float(t["max"])
+    low_now = float(t["min"])
+
     high20 = float(d["max"].iloc[-20:].max())
     low20 = float(d["min"].iloc[-20:].min())
     pos20 = (close_now - low20) / (high20 - low20 + 1e-6)
 
     ret5 = (close_now - float(d.iloc[-6]["close"])) / float(d.iloc[-6]["close"]) * 100 if len(d) >= 6 else 0
-    vol_ma5 = d["Trading_Volume"].rolling(5).mean().iloc[-1]
+    vol_ma5 = d["vol5"].iloc[-1]
     vol_ratio = float(t["Trading_Volume"]) / float(vol_ma5) if pd.notna(vol_ma5) and vol_ma5 != 0 else 1
 
     ma_bull = (
@@ -601,6 +792,10 @@ def detect_stage_advanced(df, stock_id):
         close_now > float(t["ma5"]) > float(t["ma10"]) > float(t["ma20"])
     )
     ma_slope = pd.notna(t["ma5"]) and pd.notna(prev["ma5"]) and float(t["ma5"]) > float(prev["ma5"])
+
+    recent_high_10 = float(d["max"].iloc[-10:-1].max())
+    fake_break = high_now > recent_high_10 and close_now < recent_high_10
+    upper_shadow_pct = ((high_now - max(open_now, close_now)) / close_now * 100) if close_now != 0 else 0
 
     if pos20 < 0.20:
         stage = "①"
@@ -627,6 +822,12 @@ def detect_stage_advanced(df, stock_id):
         stage_name = "噴出"
         desc = "短線已進入噴出區，追價風險顯著提高。"
 
+    if fake_break:
+        desc += " 目前出現假突破跡象。"
+
+    if upper_shadow_pct > 2.0:
+        desc += " 上影較長，需防沖高回落。"
+
     chip = check_400_holder_change(stock_id)
 
     return {
@@ -634,14 +835,16 @@ def detect_stage_advanced(df, stock_id):
         "stage_name": stage_name,
         "stage_desc": f"{desc} (更新時間: {now_hhmm()})",
         "chip_warning": chip["warning"],
-        "chip_message": chip["message"]
+        "chip_message": chip["message"],
+        "fake_break": fake_break,
+        "upper_shadow_pct": round(upper_shadow_pct, 2)
     }
 
 
 # =========================
-# 明日走勢：四情境
+# AI 權重預測：四情境
 # =========================
-def build_next_day_scenarios(df, stage):
+def build_next_day_scenarios(df, stage, chip_change=0.0, us_bias="中性"):
     scenarios = {
         "開高走高": 25,
         "開高走低": 25,
@@ -672,67 +875,77 @@ def build_next_day_scenarios(df, stage):
     upper_shadow = (high_now - max(close_now, open_now)) / close_now * 100 if close_now != 0 else 0
     vol_ma5 = d["Trading_Volume"].rolling(5).mean().iloc[-1]
     vol_ratio = float(t["Trading_Volume"]) / float(vol_ma5) if pd.notna(vol_ma5) and vol_ma5 != 0 else 1
+    close_pos = (close_now - low_now) / (high_now - low_now + 1e-6)
 
+    # 依階段給基礎分布
     if stage == "①":
-        scenarios = {
-            "開高走高": 10,
-            "開高走低": 20,
-            "開低走高": 30,
-            "開低走低": 40
-        }
+        scenarios = {"開高走高": 10, "開高走低": 20, "開低走高": 30, "開低走低": 40}
     elif stage == "②":
-        scenarios = {
-            "開高走高": 25,
-            "開高走低": 20,
-            "開低走高": 35,
-            "開低走低": 20
-        }
+        scenarios = {"開高走高": 25, "開高走低": 20, "開低走高": 35, "開低走低": 20}
     elif stage == "③":
-        scenarios = {
-            "開高走高": 35,
-            "開高走低": 20,
-            "開低走高": 30,
-            "開低走低": 15
-        }
+        scenarios = {"開高走高": 35, "開高走低": 20, "開低走高": 30, "開低走低": 15}
     elif stage == "④":
-        scenarios = {
-            "開高走高": 38,
-            "開高走低": 27,
-            "開低走高": 22,
-            "開低走低": 13
-        }
+        scenarios = {"開高走高": 38, "開高走低": 27, "開低走高": 22, "開低走低": 13}
     elif stage == "⑤":
-        scenarios = {
-            "開高走高": 20,
-            "開高走低": 30,
-            "開低走高": 20,
-            "開低走低": 30
-        }
+        scenarios = {"開高走高": 20, "開高走低": 30, "開低走高": 20, "開低走低": 30}
     else:
-        scenarios = {
-            "開高走高": 12,
-            "開高走低": 38,
-            "開低走高": 10,
-            "開低走低": 40
-        }
+        scenarios = {"開高走高": 12, "開高走低": 38, "開低走高": 10, "開低走低": 40}
 
+    # 收盤位置修正
+    if close_pos > 0.7:
+        scenarios["開高走高"] += 6
+        scenarios["開低走高"] += 3
+        scenarios["開低走低"] -= 5
+    elif close_pos < 0.3:
+        scenarios["開低走低"] += 8
+        scenarios["開高走低"] += 4
+        scenarios["開高走高"] -= 5
+
+    # 強勢收紅 + 量增
     if daily_change > 2 and intraday_body > 1 and vol_ratio > 1.2:
         scenarios["開高走高"] += 6
         scenarios["開低走高"] += 4
         scenarios["開高走低"] -= 5
         scenarios["開低走低"] -= 5
 
+    # 長上影 / 高檔壓回
     if upper_shadow > 2:
         scenarios["開高走低"] += 8
         scenarios["開低走低"] += 4
         scenarios["開高走高"] -= 6
         scenarios["開低走高"] -= 6
 
+    # 收黑且量增
     if daily_change < -1 and vol_ratio > 1.1:
         scenarios["開低走低"] += 8
         scenarios["開高走低"] += 4
         scenarios["開高走高"] -= 6
         scenarios["開低走高"] -= 6
+
+    # 籌碼修正
+    if chip_change < -1.0:
+        scenarios["開高走低"] += 8
+        scenarios["開低走低"] += 10
+        scenarios["開高走高"] -= 8
+        scenarios["開低走高"] -= 6
+    elif chip_change < -0.5:
+        scenarios["開高走低"] += 5
+        scenarios["開低走低"] += 6
+        scenarios["開高走高"] -= 5
+    elif chip_change > 0.5:
+        scenarios["開高走高"] += 5
+        scenarios["開低走高"] += 4
+        scenarios["開低走低"] -= 4
+
+    # 美股偏向修正
+    if us_bias == "偏多":
+        scenarios["開高走高"] += 5
+        scenarios["開低走高"] += 3
+        scenarios["開低走低"] -= 5
+    elif us_bias == "偏空":
+        scenarios["開高走低"] += 4
+        scenarios["開低走低"] += 6
+        scenarios["開高走高"] -= 5
 
     for k in scenarios:
         scenarios[k] = max(5, scenarios[k])
@@ -764,7 +977,7 @@ def build_next_day_scenarios(df, stage):
 # =========================
 # 交易員一句話結論
 # =========================
-def build_trader_comment(stage, chip_warning, main_scenario):
+def build_trader_comment(stage, chip_warning, main_scenario, us_bias="中性"):
     if chip_warning and stage in ["⑤", "⑥"]:
         return f"高檔籌碼轉弱，優先防守 (更新時間: {now_hhmm()})"
 
@@ -775,6 +988,9 @@ def build_trader_comment(stage, chip_warning, main_scenario):
         if main_scenario in ["開高走低", "開低走低"]:
             return f"末段攻擊仍在，但隔日拉回風險偏高 (更新時間: {now_hhmm()})"
         return f"末段攻擊延續，但仍須控管追價風險 (更新時間: {now_hhmm()})"
+
+    if stage in ["③", "④"] and us_bias == "偏空":
+        return f"主升段結構仍在，但外部環境偏空 (更新時間: {now_hhmm()})"
 
     if stage in ["③", "④"]:
         return f"主升段延續，結構健康 (更新時間: {now_hhmm()})"
@@ -824,7 +1040,7 @@ def analyze_after_stock(stock_id, direction="多"):
     if score_value is None:
         return {"stock": stock_id, "error": "資料異常"}
 
-    _ = backtest_strategy(df)
+    backtest_result = backtest_strategy(df)
 
     t = df.iloc[-1]
 
@@ -832,26 +1048,47 @@ def analyze_after_stock(stock_id, direction="多"):
     high_price = round(float(t["max"]), 2)
     low_price = round(float(t["min"]), 2)
 
-    levels = build_after_levels(close_price, high_price, low_price, direction)
-
     stage_info = detect_stage_advanced(df, stock_id)
-    scenario_info = build_next_day_scenarios(df, stage_info["stage"])
+    us_block = build_us_correlation_block(stock_id)
+    chip_info = check_400_holder_change(stock_id)
+
+    levels = build_after_levels(
+        close_price,
+        high_price,
+        low_price,
+        direction,
+        stage=stage_info["stage"]
+    )
+
+    scenario_info = build_next_day_scenarios(
+        df,
+        stage_info["stage"],
+        chip_change=chip_info["change"] if chip_info["change"] is not None else 0.0,
+        us_bias=us_block["bias"]
+    )
+
     favorable_zone = build_favorable_zone(
         stage_info["stage"],
         scenario_info["main_scenario"],
         stage_info["chip_warning"]
     )
+
     comment = build_trader_comment(
         stage_info["stage"],
         stage_info["chip_warning"],
-        scenario_info["main_scenario"]
+        scenario_info["main_scenario"],
+        us_bias=us_block["bias"]
     )
+
+    risk_level = "高" if favorable_zone in ["🔴 警戒：主力出貨中", "❌ 否（風險極高）", "否（高檔拉回風險升高）"] else "中" if favorable_zone in ["有限有利（末段攻擊）", "觀察"] else "低"
 
     return {
         "stock": stock_id,
         "close": close_price,
         "high": high_price,
         "low": low_price,
+        "score": score_value,
+        "backtest": backtest_result,
         "pressure1": levels["pressure1"],
         "pressure2": levels["pressure2"],
         "support1": levels["support1"],
@@ -860,15 +1097,19 @@ def analyze_after_stock(stock_id, direction="多"):
         "stage_name": stage_info["stage_name"],
         "stage_desc": stage_info["stage_desc"],
         "chip_warning": stage_info["chip_warning"],
-        "chip_message": stage_info["chip_message"],
+        "chip_message": chip_info["message"],
+        "chip_severity": chip_info["severity"],
         "favorable_zone": favorable_zone,
         "comment": comment,
-        "scenario_info": scenario_info
+        "scenario_info": scenario_info,
+        "us_block": us_block,
+        "risk_level": risk_level,
+        "market_label": market_label(stock_id)
     }
 
 
 # =========================
-# Fugle 盤中即時
+# 盤中即時：台股 / 美股雙市場
 # =========================
 def fugle_quote(symbol, api_key):
     headers = {"X-API-KEY": api_key}
@@ -881,6 +1122,64 @@ def fugle_quote(symbol, api_key):
     except Exception:
         return None
 
+def fetch_us_intraday_quote(symbol):
+    try:
+        ticker = yf.Ticker(symbol.upper())
+        hist = ticker.history(period="2d", interval="1m")
+        if hist is None or hist.empty:
+            hist = ticker.history(period="5d", interval="1d")
+            if hist is None or hist.empty:
+                return None
+
+            last = hist.iloc[-1]
+            prev_close = hist["Close"].iloc[-2] if len(hist) >= 2 else last["Close"]
+            last_price = float(last["Close"])
+            open_price = float(last["Open"])
+            high_price = float(last["High"])
+            low_price = float(last["Low"])
+            ref_price = float(prev_close)
+            change_pct = (last_price - ref_price) / ref_price * 100 if ref_price != 0 else 0
+
+            return {
+                "lastPrice": last_price,
+                "openPrice": open_price,
+                "highPrice": high_price,
+                "lowPrice": low_price,
+                "referencePrice": ref_price,
+                "changePercent": round(change_pct, 2)
+            }
+
+        today_df = hist.copy()
+        last_row = today_df.iloc[-1]
+        open_price = float(today_df["Open"].iloc[0])
+        high_price = float(today_df["High"].max())
+        low_price = float(today_df["Low"].min())
+        last_price = float(last_row["Close"])
+
+        daily = ticker.history(period="5d", interval="1d")
+        ref_price = float(daily["Close"].iloc[-2]) if daily is not None and len(daily) >= 2 else open_price
+        change_pct = (last_price - ref_price) / ref_price * 100 if ref_price != 0 else 0
+
+        return {
+            "lastPrice": last_price,
+            "openPrice": open_price,
+            "highPrice": high_price,
+            "lowPrice": low_price,
+            "referencePrice": ref_price,
+            "changePercent": round(change_pct, 2)
+        }
+    except Exception:
+        return None
+
+def fetch_live_quote(symbol):
+    if is_us_symbol(symbol):
+        return fetch_us_intraday_quote(symbol)
+
+    api_key = st.secrets.get("FUGLE_API_KEY", "")
+    if not api_key:
+        return None
+    return fugle_quote(symbol, api_key)
+
 def build_intraday_plan(price, open_price, high, low, ref_price, pressure, support, direction="多"):
     if direction == "多":
         entry_price = round(pressure, 2)
@@ -888,10 +1187,15 @@ def build_intraday_plan(price, open_price, high, low, ref_price, pressure, suppo
         tp1 = round(pressure + (pressure - support) * 0.5, 2)
         tp2 = round(pressure + (pressure - support) * 1.0, 2)
 
-        if price > pressure and price >= open_price and price >= ref_price:
-            status = f"已突破壓力 (更新時間: {now_hhmm()})"
+        # 不宜追價條件
+        chase_gap = ((price - entry_price) / entry_price * 100) if entry_price != 0 else 0
+
+        if price > pressure and price >= open_price and price >= ref_price and chase_gap <= 1.5:
+            status = f"已突破壓力，可依紀律追蹤 (更新時間: {now_hhmm()})"
+        elif price > pressure and chase_gap > 1.5:
+            status = f"已突破但乖離偏大，不宜追價 (更新時間: {now_hhmm()})"
         elif high > pressure and price < pressure:
-            status = f"盤中假突破 (更新時間: {now_hhmm()})"
+            status = f"盤中假突破，需防回落 (更新時間: {now_hhmm()})"
         else:
             status = f"尚未突破壓力 (更新時間: {now_hhmm()})"
 
@@ -902,9 +1206,9 @@ def build_intraday_plan(price, open_price, high, low, ref_price, pressure, suppo
         tp2 = round(support - (pressure - support) * 1.0, 2)
 
         if price < support and price <= open_price and price <= ref_price:
-            status = f"已跌破支撐 (更新時間: {now_hhmm()})"
+            status = f"已跌破支撐，空方延續 (更新時間: {now_hhmm()})"
         elif low < support and price > support:
-            status = f"盤中假跌破 (更新時間: {now_hhmm()})"
+            status = f"盤中假跌破，空方追擊風險高 (更新時間: {now_hhmm()})"
         else:
             status = f"尚未跌破支撐 (更新時間: {now_hhmm()})"
 
@@ -951,12 +1255,12 @@ with tab1:
             st.error(res["error"])
         else:
             auto_fundamental = build_auto_fundamental_summary(stock_id)
-            us_block = build_us_correlation_block(stock_id)
+            us_block = res["us_block"]
 
             st.session_state.after_result = {
                 "stock": stock_id,
                 "stock_name": stock_name,
-                "market": market,
+                "market": market if market else res["market_label"],
                 "cost": cost,
                 "direction": direction,
                 "auto_fundamental": auto_fundamental,
@@ -972,17 +1276,30 @@ with tab1:
                 "chip_message": res["chip_message"],
                 "comment": res["comment"],
                 "scenario_info": res["scenario_info"],
-                "us_block": us_block
+                "us_block": us_block,
+                "risk_level": res["risk_level"],
+                "market_label": res["market_label"]
             }
 
             st.subheader("交易員判讀結論")
             st.markdown(f"### {res['comment']}")
+
+            st.subheader("市場別")
+            st.write(f"{res['market_label']} (更新時間: {now_hhmm()})")
+
+            st.subheader("風險燈號")
+            risk_color = "#16a34a" if res["risk_level"] == "低" else "#d97706" if res["risk_level"] == "中" else "#dc2626"
+            st.markdown(
+                f"<div style='font-weight:700;color:{risk_color};'>風險等級：{res['risk_level']} (更新時間: {now_hhmm()})</div>",
+                unsafe_allow_html=True
+            )
 
             st.subheader("基本面摘要")
             st.write(auto_fundamental)
 
             st.subheader("美股連動觀測")
             st.write(f"對位邏輯：{us_block['mapping_label']} (更新時間: {now_hhmm()})")
+            st.write(f"美股連動偏向：{us_block['bias']} (更新時間: {now_hhmm()})")
             if us_block["indices"]:
                 cols = st.columns(len(us_block["indices"]))
                 for i, item in enumerate(us_block["indices"]):
@@ -1004,8 +1321,18 @@ with tab1:
                     f"{res['favorable_zone']} (更新時間: {now_hhmm()})</div>",
                     unsafe_allow_html=True
                 )
+            elif res["favorable_zone"] in ["有限有利（末段攻擊）", "觀察"]:
+                c2.markdown(
+                    f"<div style='font-size:1.02rem;font-weight:700;color:#d97706;padding-top:0.4rem;'>"
+                    f"{res['favorable_zone']} (更新時間: {now_hhmm()})</div>",
+                    unsafe_allow_html=True
+                )
             else:
-                c2.metric("相對有利區", f"{res['favorable_zone']} (更新時間: {now_hhmm()})")
+                c2.markdown(
+                    f"<div style='font-size:1.02rem;font-weight:700;color:#16a34a;padding-top:0.4rem;'>"
+                    f"{res['favorable_zone']} (更新時間: {now_hhmm()})</div>",
+                    unsafe_allow_html=True
+                )
 
             st.write(res["stage_desc"])
 
@@ -1065,6 +1392,8 @@ with tab2:
     default_comment = after_data["comment"] if after_data else f"請先進行盤後分析。(更新時間: {now_hhmm()})"
     default_us_block = after_data["us_block"] if after_data else build_us_correlation_block(default_stock)
     default_main_scenario = after_data["scenario_info"]["main_scenario"] if after_data else "未知"
+    default_risk_level = after_data["risk_level"] if after_data else "未知"
+    default_market_label = after_data["market_label"] if after_data else market_label(default_stock)
 
     with st.form("intra_form"):
         stock_i = st.text_input("股票代號", value=default_stock).strip()
@@ -1077,16 +1406,10 @@ with tab2:
         submitted_intra = st.form_submit_button("更新盤中判斷")
 
     if submitted_intra:
-        try:
-            api_key = st.secrets["FUGLE_API_KEY"]
-        except Exception:
-            st.error("尚未在 Streamlit Secrets 設定 FUGLE_API_KEY")
-            st.stop()
-
-        data = fugle_quote(stock_i, api_key)
+        data = fetch_live_quote(stock_i)
 
         if not data:
-            st.error("抓不到盤中資料，請確認股票代號或目前是否有行情")
+            st.error("抓不到盤中資料，請確認股票代號、網路來源或目前是否有行情")
         else:
             plan = build_intraday_plan(
                 price=safe_float(data.get("lastPrice", 0)),
@@ -1102,11 +1425,22 @@ with tab2:
             st.subheader("交易員判讀結論")
             st.markdown(f"### {default_comment}")
 
+            st.subheader("市場別")
+            st.write(f"{default_market_label} (更新時間: {now_hhmm()})")
+
+            st.subheader("風險燈號")
+            risk_color = "#16a34a" if default_risk_level == "低" else "#d97706" if default_risk_level == "中" else "#dc2626"
+            st.markdown(
+                f"<div style='font-weight:700;color:{risk_color};'>風險等級：{default_risk_level} (更新時間: {now_hhmm()})</div>",
+                unsafe_allow_html=True
+            )
+
             st.subheader("基本面摘要")
             st.write(default_fundamental)
 
             st.subheader("美股連動觀測")
             st.write(f"對位邏輯：{default_us_block['mapping_label']} (更新時間: {now_hhmm()})")
+            st.write(f"美股連動偏向：{default_us_block['bias']} (更新時間: {now_hhmm()})")
             if default_us_block["indices"]:
                 cols = st.columns(len(default_us_block["indices"]))
                 for i, item in enumerate(default_us_block["indices"]):
@@ -1128,8 +1462,18 @@ with tab2:
                     f"{default_favorable} (更新時間: {now_hhmm()})</div>",
                     unsafe_allow_html=True
                 )
+            elif default_favorable in ["有限有利（末段攻擊）", "觀察"]:
+                s2.markdown(
+                    f"<div style='font-size:1.02rem;font-weight:700;color:#d97706;padding-top:0.4rem;'>"
+                    f"{default_favorable} (更新時間: {now_hhmm()})</div>",
+                    unsafe_allow_html=True
+                )
             else:
-                s2.metric("相對有利區", f"{default_favorable} (更新時間: {now_hhmm()})")
+                s2.markdown(
+                    f"<div style='font-size:1.02rem;font-weight:700;color:#16a34a;padding-top:0.4rem;'>"
+                    f"{default_favorable} (更新時間: {now_hhmm()})</div>",
+                    unsafe_allow_html=True
+                )
 
             st.write(default_stage_desc)
             st.write(f"主要劇本：{default_main_scenario} (更新時間: {now_hhmm()})")
