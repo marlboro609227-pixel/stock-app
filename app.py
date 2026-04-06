@@ -27,6 +27,12 @@ def fmt_num(x, digits=2):
     except Exception:
         return "-"
 
+def safe_float(x, default=0.0):
+    try:
+        return float(x)
+    except Exception:
+        return default
+
 def volume_to_human(v):
     try:
         v = float(v)
@@ -38,15 +44,9 @@ def volume_to_human(v):
         return f"{v/10000:.2f}萬"
     return f"{int(v)}"
 
-def safe_float(x, default=0.0):
-    try:
-        return float(x)
-    except Exception:
-        return default
-
 
 # =========================
-# 專業作戰時程表
+# 側邊欄：專業作戰時程表
 # =========================
 def render_battle_timetable():
     st.sidebar.markdown(
@@ -58,7 +58,7 @@ def render_battle_timetable():
             background-color: #f8fafc;
             margin-bottom: 12px;
         ">
-            <div style="font-size: 1.1rem; font-weight: 700; margin-bottom: 10px;">
+            <div style="font-size: 1.08rem; font-weight: 700; margin-bottom: 10px;">
                 🛡️ 專業作戰時程指引
             </div>
 
@@ -66,16 +66,16 @@ def render_battle_timetable():
                 <div style="font-weight: 700; color: #0f9d58;">
                     • 🟢 凌晨 05:00 - 08:30【最佳盤後分析期】
                 </div>
-                <div>• 任務：執行 tab1 分析，確認美股收盤漲跌與 ⑤ 號門標的。</div>
-                <div>• 核心：根據大戶籌碼與美股動能，定下今日「計畫性交易」目標。</div>
+                <div>• 任務：執行盤後分析，確認美股收盤漲跌與高檔結構標的。</div>
+                <div>• 核心：依美股動能、籌碼與隔日劇本，先定好當日計畫。</div>
             </div>
 
             <div style="margin-bottom: 12px;">
                 <div style="font-weight: 700; color: #d97706;">
                     • 🔥 早上 09:00 - 11:00【黃金實戰扣動期】
                 </div>
-                <div>• 任務：切換 tab2 盤中判斷，監控即時價位。</div>
-                <div>• 核心：嚴格執行壓力位突破進場，並守好 App 算出的停損價位。</div>
+                <div>• 任務：切換盤中判斷，監控即時價位。</div>
+                <div>• 核心：只依壓力 / 支撐與停損紀律執行，不憑感覺追單。</div>
             </div>
 
             <div>
@@ -83,7 +83,7 @@ def render_battle_timetable():
                     • 💤 早上 11:00 之後【收盤與身心休養】
                 </div>
                 <div>• 任務：停止新開倉動作。</div>
-                <div>• 核心：讓獲利奔跑或交由停損單自動執行，回歸正常作息。</div>
+                <div>• 核心：讓獲利奔跑或交由停損單處理，回歸正常作息。</div>
             </div>
         </div>
         """,
@@ -92,7 +92,7 @@ def render_battle_timetable():
 
 
 # =========================
-# 時間紅綠燈
+# 頂部時間紅綠燈
 # =========================
 def render_time_banner():
     now = tw_now()
@@ -119,8 +119,50 @@ def render_time_banner():
             padding:10px 14px;
             border-radius:10px;
             font-weight:700;
-            margin-bottom:8px;">
+            margin-bottom:10px;">
             目前系統時間：{now.strftime("%Y-%m-%d %H:%M:%S")}　{msg}
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+
+# =========================
+# 頁籤專屬使用時段提示
+# =========================
+def render_after_usage_note():
+    st.markdown(
+        """
+        <div style="
+            border:1px solid #2e7d32;
+            background:#e8f5e9;
+            color:#1b5e20;
+            padding:12px 14px;
+            border-radius:10px;
+            font-weight:700;
+            margin-bottom:12px;">
+            盤後分析使用時段：建議於凌晨 05:00 - 08:00 閱讀
+            <br>
+            建議用途：確認美股收盤、籌碼方向與隔日主要劇本。
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+def render_intra_usage_note():
+    st.markdown(
+        """
+        <div style="
+            border:1px solid #ef6c00;
+            background:#fff3e0;
+            color:#e65100;
+            padding:12px 14px;
+            border-radius:10px;
+            font-weight:700;
+            margin-bottom:12px;">
+            盤中判斷使用時段：建議於早上 09:00 - 11:00 使用
+            <br>
+            建議用途：依壓力 / 支撐與即時價位執行進場、停損與分批賣出。
         </div>
         """,
         unsafe_allow_html=True
@@ -254,12 +296,10 @@ def _normalize_close_series(df):
     if df is None or len(df) == 0:
         return None
 
-    # 一般情況：單層欄位
     if "Close" in df.columns:
         close_obj = df["Close"]
     else:
         close_obj = None
-        # 多層欄位時，找最後一層名為 Close 的欄
         if isinstance(df.columns, pd.MultiIndex):
             for col in df.columns:
                 if str(col[-1]) == "Close":
@@ -269,7 +309,6 @@ def _normalize_close_series(df):
     if close_obj is None:
         return None
 
-    # 若還是 DataFrame，取第一欄
     if isinstance(close_obj, pd.DataFrame):
         if close_obj.shape[1] == 0:
             return None
@@ -507,38 +546,9 @@ def backtest_strategy(df):
         "trades": len(returns)
     }
 
-def forecast_tomorrow(score_value, win_rate, avg_return):
-    if score_value >= 80 and win_rate >= 55 and avg_return > 0:
-        return 55, 30, 15
-    elif score_value >= 70 and win_rate >= 50:
-        return 45, 35, 20
-    elif score_value >= 50:
-        return 30, 40, 30
-    else:
-        return 20, 35, 45
-
-def build_after_levels(close_price, high_price, low_price, direction="多"):
-    if direction == "多":
-        pressure1 = round(high_price, 2)
-        pressure2 = round(high_price * 1.03, 2)
-        support1 = round(low_price, 2)
-        stop_loss = round(min(low_price, close_price * 0.985), 2)
-    else:
-        pressure1 = round(high_price, 2)
-        pressure2 = round(high_price * 1.02, 2)
-        support1 = round(low_price, 2)
-        stop_loss = round(high_price * 1.015, 2)
-
-    return {
-        "pressure1": pressure1,
-        "pressure2": pressure2,
-        "support1": support1,
-        "stop_loss": stop_loss
-    }
-
 
 # =========================
-# 進階階段判斷 + 一句話結論
+# 階段判斷
 # =========================
 def detect_stage_advanced(df, stock_id):
     if df is None or len(df) < 30:
@@ -546,7 +556,6 @@ def detect_stage_advanced(df, stock_id):
             "stage": "-",
             "stage_name": "資料不足",
             "stage_desc": f"資料不足，無法進行階段判斷。(更新時間: {now_hhmm()})",
-            "favorable_zone": "未知",
             "chip_warning": False,
             "chip_message": f"無法判斷籌碼變化。(更新時間: {now_hhmm()})"
         }
@@ -555,7 +564,6 @@ def detect_stage_advanced(df, stock_id):
     d["ma5"] = d["close"].rolling(5).mean()
     d["ma10"] = d["close"].rolling(10).mean()
     d["ma20"] = d["close"].rolling(20).mean()
-    d["vol5"] = d["Trading_Volume"].rolling(5).mean()
 
     t = d.iloc[-1]
     prev = d.iloc[-2]
@@ -568,7 +576,6 @@ def detect_stage_advanced(df, stock_id):
     ret5 = (close_now - float(d.iloc[-6]["close"])) / float(d.iloc[-6]["close"]) * 100 if len(d) >= 6 else 0
     vol_ma5 = d["Trading_Volume"].rolling(5).mean().iloc[-1]
     vol_ratio = float(t["Trading_Volume"]) / float(vol_ma5) if pd.notna(vol_ma5) and vol_ma5 != 0 else 1
-    breakout = close_now >= float(d["max"].iloc[-10:-1].max())
 
     ma_bull = (
         pd.notna(t["ma5"]) and pd.notna(t["ma10"]) and pd.notna(t["ma20"]) and
@@ -576,72 +583,231 @@ def detect_stage_advanced(df, stock_id):
     )
     ma_slope = pd.notna(t["ma5"]) and pd.notna(prev["ma5"]) and float(t["ma5"]) > float(prev["ma5"])
 
-    fake_break = (float(t["max"]) > high20) and (close_now < high20)
-
     if pos20 < 0.20:
         stage = "①"
         stage_name = "底部"
         desc = "仍在低檔整理，尚未形成有效攻擊結構。"
-        favorable = "否"
     elif pos20 < 0.45:
         stage = "②"
         stage_name = "起漲"
         desc = "股價開始脫離低檔，屬起漲初期。"
-        favorable = "觀察"
     elif pos20 < 0.65 and ma_bull and ma_slope:
         stage = "③"
         stage_name = "攻擊"
         desc = "主升段啟動，結構明顯轉強。"
-        favorable = "是"
     elif pos20 < 0.80 and ma_bull and vol_ratio > 1.2:
         stage = "④"
         stage_name = "軋空"
         desc = "量價同步加速，進入強勢推升區。"
-        favorable = "是"
     elif pos20 < 0.92 and ret5 > 6:
         stage = "⑤"
         stage_name = "末段攻擊"
         desc = "股價已接近高檔，但仍維持末段攻擊結構。"
-        favorable = "是"
     else:
         stage = "⑥"
         stage_name = "噴出"
         desc = "短線已進入噴出區，追價風險顯著提高。"
-        favorable = "❌ 否（風險極高）"
-
-    if fake_break:
-        desc += " 目前存在假突破跡象。"
 
     chip = check_400_holder_change(stock_id)
-
-    if stage in ["⑤", "⑥"] and chip["warning"]:
-        favorable = "🔴 警戒：主力出貨中"
-        desc = "目前位於高檔階段，但400張以上大戶持股比例較前一期下降超過0.5%，疑似主力出貨。"
-
-    if stage == "⑥" and not chip["warning"]:
-        desc += " 現階段不宜聽信內線追高。"
 
     return {
         "stage": stage,
         "stage_name": stage_name,
         "stage_desc": f"{desc} (更新時間: {now_hhmm()})",
-        "favorable_zone": favorable,
         "chip_warning": chip["warning"],
         "chip_message": chip["message"]
     }
 
-def build_trader_comment(stage, chip_warning):
+
+# =========================
+# 明日走勢：4 情境劇本
+# =========================
+def build_next_day_scenarios(df, stage):
+    """
+    回傳：
+    - 開高走高
+    - 開高走低
+    - 開低走高
+    - 開低走低
+    - main_scenario
+    - response_note
+    """
+    # 基礎預設
+    scenarios = {
+        "開高走高": 25,
+        "開高走低": 25,
+        "開低走高": 25,
+        "開低走低": 25
+    }
+
+    if df is None or len(df) < 30:
+        main_name = max(scenarios, key=scenarios.get)
+        return {
+            "scenarios": scenarios,
+            "main_scenario": main_name,
+            "response_note": f"資料不足，先以保守觀察為主。(更新時間: {now_hhmm()})"
+        }
+
+    d = df.copy().reset_index(drop=True)
+    t = d.iloc[-1]
+    p = d.iloc[-2]
+
+    close_now = float(t["close"])
+    open_now = float(t["open"])
+    high_now = float(t["max"])
+    low_now = float(t["min"])
+    prev_close = float(p["close"])
+
+    daily_change = (close_now - prev_close) / prev_close * 100 if prev_close != 0 else 0
+    intraday_body = (close_now - open_now) / open_now * 100 if open_now != 0 else 0
+    upper_shadow = (high_now - max(close_now, open_now)) / close_now * 100 if close_now != 0 else 0
+    vol_ma5 = d["Trading_Volume"].rolling(5).mean().iloc[-1]
+    vol_ratio = float(t["Trading_Volume"]) / float(vol_ma5) if pd.notna(vol_ma5) and vol_ma5 != 0 else 1
+
+    # 先依 stage 給基礎分布
+    if stage == "①":
+        scenarios = {
+            "開高走高": 10,
+            "開高走低": 20,
+            "開低走高": 30,
+            "開低走低": 40
+        }
+    elif stage == "②":
+        scenarios = {
+            "開高走高": 25,
+            "開高走低": 20,
+            "開低走高": 35,
+            "開低走低": 20
+        }
+    elif stage == "③":
+        scenarios = {
+            "開高走高": 35,
+            "開高走低": 20,
+            "開低走高": 30,
+            "開低走低": 15
+        }
+    elif stage == "④":
+        scenarios = {
+            "開高走高": 38,
+            "開高走低": 27,
+            "開低走高": 22,
+            "開低走低": 13
+        }
+    elif stage == "⑤":
+        scenarios = {
+            "開高走高": 20,
+            "開高走低": 30,
+            "開低走高": 20,
+            "開低走低": 30
+        }
+    else:  # ⑥
+        scenarios = {
+            "開高走高": 12,
+            "開高走低": 38,
+            "開低走高": 10,
+            "開低走低": 40
+        }
+
+    # 依當日K棒細修
+    # 強勢收紅 + 量增
+    if daily_change > 2 and intraday_body > 1 and vol_ratio > 1.2:
+        scenarios["開高走高"] += 6
+        scenarios["開低走高"] += 4
+        scenarios["開高走低"] -= 5
+        scenarios["開低走低"] -= 5
+
+    # 長上影 / 高檔壓回
+    if upper_shadow > 2:
+        scenarios["開高走低"] += 8
+        scenarios["開低走低"] += 4
+        scenarios["開高走高"] -= 6
+        scenarios["開低走高"] -= 6
+
+    # 收黑且量增
+    if daily_change < -1 and vol_ratio > 1.1:
+        scenarios["開低走低"] += 8
+        scenarios["開高走低"] += 4
+        scenarios["開高走高"] -= 6
+        scenarios["開低走高"] -= 6
+
+    # 正規化
+    for k in scenarios:
+        scenarios[k] = max(5, scenarios[k])
+
+    total = sum(scenarios.values())
+    scenarios = {k: round(v / total * 100) for k, v in scenarios.items()}
+
+    # 補正四捨五入誤差
+    diff = 100 - sum(scenarios.values())
+    if diff != 0:
+        main_key = max(scenarios, key=scenarios.get)
+        scenarios[main_key] += diff
+
+    main_name = max(scenarios, key=scenarios.get)
+
+    response_map = {
+        "開高走高": f"主要劇本為開高走高，盤前應對以順勢突破追蹤為主。(更新時間: {now_hhmm()})",
+        "開高走低": f"主要劇本為開高走低，盤前應對應避免開盤追價，慎防沖高回落。(更新時間: {now_hhmm()})",
+        "開低走高": f"主要劇本為開低走高，盤前應對宜等回穩後再介入，不宜急單。(更新時間: {now_hhmm()})",
+        "開低走低": f"主要劇本為開低走低，盤前應對以防守為主，不主動追多。(更新時間: {now_hhmm()})"
+    }
+
+    return {
+        "scenarios": scenarios,
+        "main_scenario": main_name,
+        "response_note": response_map[main_name]
+    }
+
+
+# =========================
+# 交易員一句話結論
+# =========================
+def build_trader_comment(stage, chip_warning, main_scenario):
+    if chip_warning and stage in ["⑤", "⑥"]:
+        return f"高檔籌碼轉弱，優先防守 (更新時間: {now_hhmm()})"
+
     if stage == "⑥":
         return f"噴出過熱，嚴禁追價 (更新時間: {now_hhmm()})"
-    if stage == "⑤" and chip_warning:
-        return f"末段攻擊但籌碼轉弱 (更新時間: {now_hhmm()})"
+
+    if stage == "⑤":
+        if main_scenario in ["開高走低", "開低走低"]:
+            return f"末段攻擊仍在，但隔日拉回風險偏高 (更新時間: {now_hhmm()})"
+        return f"末段攻擊延續，但仍須控管追價風險 (更新時間: {now_hhmm()})"
+
     if stage in ["③", "④"]:
         return f"主升段延續，結構健康 (更新時間: {now_hhmm()})"
+
     if stage == "②":
         return f"起漲初期，可持續觀察 (更新時間: {now_hhmm()})"
+
     if stage == "①":
         return f"仍在築底，暫不介入 (更新時間: {now_hhmm()})"
+
     return f"結構不明，建議觀望 (更新時間: {now_hhmm()})"
+
+
+# =========================
+# 相對有利區：整合 stage + 情境 + 籌碼
+# =========================
+def build_favorable_zone(stage, main_scenario, chip_warning):
+    if chip_warning and stage in ["⑤", "⑥"]:
+        return "🔴 警戒：主力出貨中"
+
+    if stage in ["③", "④"]:
+        return "是（主升段）"
+
+    if stage == "⑤":
+        if main_scenario in ["開高走低", "開低走低"]:
+            return "否（高檔拉回風險升高）"
+        return "有限有利（末段攻擊）"
+
+    if stage == "⑥":
+        return "❌ 否（風險極高）"
+
+    if stage == "②":
+        return "觀察"
+
+    return "否"
 
 
 # =========================
@@ -666,30 +832,36 @@ def analyze_after_stock(stock_id, direction="多"):
     high_price = round(float(t["max"]), 2)
     low_price = round(float(t["min"]), 2)
 
-    up_prob, side_prob, down_prob = forecast_tomorrow(score_value, win_rate, avg_return)
-    levels = build_after_levels(close_price, high_price, low_price, direction)
     stage_info = detect_stage_advanced(df, stock_id)
-    comment = build_trader_comment(stage_info["stage"], stage_info["chip_warning"])
+    scenario_info = build_next_day_scenarios(df, stage_info["stage"])
+    favorable_zone = build_favorable_zone(
+        stage_info["stage"],
+        scenario_info["main_scenario"],
+        stage_info["chip_warning"]
+    )
+    comment = build_trader_comment(
+        stage_info["stage"],
+        stage_info["chip_warning"],
+        scenario_info["main_scenario"]
+    )
 
     return {
         "stock": stock_id,
         "close": close_price,
         "high": high_price,
         "low": low_price,
-        "up_prob": up_prob,
-        "side_prob": side_prob,
-        "down_prob": down_prob,
-        "pressure1": levels["pressure1"],
-        "pressure2": levels["pressure2"],
-        "support1": levels["support1"],
-        "stop_loss": levels["stop_loss"],
+        "pressure1": build_after_levels(close_price, high_price, low_price, direction)["pressure1"],
+        "pressure2": build_after_levels(close_price, high_price, low_price, direction)["pressure2"],
+        "support1": build_after_levels(close_price, high_price, low_price, direction)["support1"],
+        "stop_loss": build_after_levels(close_price, high_price, low_price, direction)["stop_loss"],
         "stage": stage_info["stage"],
         "stage_name": stage_info["stage_name"],
         "stage_desc": stage_info["stage_desc"],
-        "favorable_zone": stage_info["favorable_zone"],
         "chip_warning": stage_info["chip_warning"],
         "chip_message": stage_info["chip_message"],
-        "comment": comment
+        "favorable_zone": favorable_zone,
+        "comment": comment,
+        "scenario_info": scenario_info
     }
 
 
@@ -759,6 +931,7 @@ render_time_banner()
 tab1, tab2 = st.tabs(["盤後分析", "盤中判斷"])
 
 with tab1:
+    render_after_usage_note()
     st.title("盤後分析")
 
     with st.form("after_form"):
@@ -796,6 +969,7 @@ with tab1:
                 "chip_warning": res["chip_warning"],
                 "chip_message": res["chip_message"],
                 "comment": res["comment"],
+                "scenario_info": res["scenario_info"],
                 "us_block": us_block
             }
 
@@ -822,9 +996,9 @@ with tab1:
             c1, c2 = st.columns([1, 2])
             c1.metric("階段", f"{res['stage']} {res['stage_name']}")
 
-            if res["favorable_zone"] in ["🔴 警戒：主力出貨中", "❌ 否（風險極高）"]:
+            if res["favorable_zone"] in ["🔴 警戒：主力出貨中", "❌ 否（風險極高）", "否（高檔拉回風險升高）"]:
                 c2.markdown(
-                    f"<div style='font-size:1.05rem;font-weight:700;color:#ff4b4b;padding-top:0.4rem;'>"
+                    f"<div style='font-size:1.02rem;font-weight:700;color:#ff4b4b;padding-top:0.4rem;'>"
                     f"{res['favorable_zone']} (更新時間: {now_hhmm()})</div>",
                     unsafe_allow_html=True
                 )
@@ -842,12 +1016,23 @@ with tab1:
             else:
                 st.write(res["chip_message"])
 
-            st.subheader("明日走勢機率")
-            p1, p2, p3 = st.columns(3)
-            p1.metric("上攻", f"{res['up_prob']}%")
-            p2.metric("震盪", f"{res['side_prob']}%")
-            p3.metric("下跌", f"{res['down_prob']}%")
+            st.subheader("明日走勢推演（盤前規劃用）")
+            s = res["scenario_info"]["scenarios"]
+            g1, g2 = st.columns(2)
+            g3, g4 = st.columns(2)
+
+            g1.metric("開高走高", f"{s['開高走高']}%")
+            g2.metric("開高走低", f"{s['開高走低']}%")
+            g3.metric("開低走高", f"{s['開低走高']}%")
+            g4.metric("開低走低", f"{s['開低走低']}%")
+
             st.caption(f"更新時間: {now_hhmm()}")
+
+            st.subheader("主要劇本")
+            st.write(f"{res['scenario_info']['main_scenario']} (更新時間: {now_hhmm()})")
+
+            st.subheader("盤前應對")
+            st.write(res["scenario_info"]["response_note"])
 
             st.subheader("關鍵價位")
             d1, d2, d3, d4 = st.columns(4)
@@ -858,6 +1043,7 @@ with tab1:
             st.caption(f"更新時間: {now_hhmm()}")
 
 with tab2:
+    render_intra_usage_note()
     st.title("盤中判斷")
 
     after_data = st.session_state.after_result
@@ -876,6 +1062,7 @@ with tab2:
     default_chip_warning = after_data["chip_warning"] if after_data else False
     default_comment = after_data["comment"] if after_data else f"請先進行盤後分析。(更新時間: {now_hhmm()})"
     default_us_block = after_data["us_block"] if after_data else build_us_correlation_block(default_stock)
+    default_main_scenario = after_data["scenario_info"]["main_scenario"] if after_data else "未知"
 
     with st.form("intra_form"):
         stock_i = st.text_input("股票代號", value=default_stock).strip()
@@ -933,9 +1120,9 @@ with tab2:
             s1, s2 = st.columns([1, 2])
             s1.metric("階段", f"{default_stage} {default_stage_name}")
 
-            if default_favorable in ["🔴 警戒：主力出貨中", "❌ 否（風險極高）"]:
+            if default_favorable in ["🔴 警戒：主力出貨中", "❌ 否（風險極高）", "否（高檔拉回風險升高）"]:
                 s2.markdown(
-                    f"<div style='font-size:1.05rem;font-weight:700;color:#ff4b4b;padding-top:0.4rem;'>"
+                    f"<div style='font-size:1.02rem;font-weight:700;color:#ff4b4b;padding-top:0.4rem;'>"
                     f"{default_favorable} (更新時間: {now_hhmm()})</div>",
                     unsafe_allow_html=True
                 )
@@ -943,6 +1130,8 @@ with tab2:
                 s2.metric("相對有利區", f"{default_favorable} (更新時間: {now_hhmm()})")
 
             st.write(default_stage_desc)
+            st.write(f"主要劇本：{default_main_scenario} (更新時間: {now_hhmm()})")
+
             if default_chip_warning:
                 st.warning("近5日400張以上大戶持股比例下降，盤中應降低追價意願。")
 
@@ -955,7 +1144,7 @@ with tab2:
             c5.metric("漲跌幅", f"{fmt_num(data.get('changePercent', 0))}%")
             st.caption(f"更新時間: {now_hhmm()}")
 
-            st.subheader("盤中關鍵價位")
+            st.subheader("盤中關鍵價位（09:00-11:00 執行用）")
             d1, d2, d3, d4 = st.columns(4)
             d1.metric("進場價", fmt_num(plan["entry_price"]))
             d2.metric("停損價", fmt_num(plan["stop_loss"]))
