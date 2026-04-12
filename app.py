@@ -41,8 +41,7 @@ def safe_float(x, default=0.0):
 
 def safe_int(x, default=0):
     try:
-        v = int(float(x))
-        return v
+        return int(float(x))
     except Exception:
         return default
 
@@ -311,7 +310,6 @@ def fetch_us_daily_data(symbol, period="6mo"):
     if df is None or df.empty:
         return None
 
-    # 處理多層欄位
     if isinstance(df.columns, pd.MultiIndex):
         new_df = pd.DataFrame()
         for field, target_name in [
@@ -500,7 +498,6 @@ def build_us_correlation_block(stock_id):
     info = fetch_stock_info(stock_id)
     industry = info["industry_category"] if info else ""
 
-    # 若本身是美股，則直接以 Nasdaq 與 S&P 作大盤參照
     if is_us_symbol(stock_id):
         tickers = ["^IXIC", "^GSPC"]
         label = "Nasdaq / S&P 500"
@@ -562,7 +559,6 @@ def fetch_400_holder_ratio(stock_id):
     df[percent_col] = pd.to_numeric(df[percent_col], errors="coerce")
     df = df.dropna(subset=[percent_col])
 
-    # 400張以上
     df_400 = df[df[level_col].str.contains("400|600|800|1000", na=False)].copy()
     if df_400.empty:
         return None
@@ -877,7 +873,6 @@ def build_next_day_scenarios(df, stage, chip_change=0.0, us_bias="中性"):
     vol_ratio = float(t["Trading_Volume"]) / float(vol_ma5) if pd.notna(vol_ma5) and vol_ma5 != 0 else 1
     close_pos = (close_now - low_now) / (high_now - low_now + 1e-6)
 
-    # 依階段給基礎分布
     if stage == "①":
         scenarios = {"開高走高": 10, "開高走低": 20, "開低走高": 30, "開低走低": 40}
     elif stage == "②":
@@ -891,7 +886,6 @@ def build_next_day_scenarios(df, stage, chip_change=0.0, us_bias="中性"):
     else:
         scenarios = {"開高走高": 12, "開高走低": 38, "開低走高": 10, "開低走低": 40}
 
-    # 收盤位置修正
     if close_pos > 0.7:
         scenarios["開高走高"] += 6
         scenarios["開低走高"] += 3
@@ -901,28 +895,24 @@ def build_next_day_scenarios(df, stage, chip_change=0.0, us_bias="中性"):
         scenarios["開高走低"] += 4
         scenarios["開高走高"] -= 5
 
-    # 強勢收紅 + 量增
     if daily_change > 2 and intraday_body > 1 and vol_ratio > 1.2:
         scenarios["開高走高"] += 6
         scenarios["開低走高"] += 4
         scenarios["開高走低"] -= 5
         scenarios["開低走低"] -= 5
 
-    # 長上影 / 高檔壓回
     if upper_shadow > 2:
         scenarios["開高走低"] += 8
         scenarios["開低走低"] += 4
         scenarios["開高走高"] -= 6
         scenarios["開低走高"] -= 6
 
-    # 收黑且量增
     if daily_change < -1 and vol_ratio > 1.1:
         scenarios["開低走低"] += 8
         scenarios["開高走低"] += 4
         scenarios["開高走高"] -= 6
         scenarios["開低走高"] -= 6
 
-    # 籌碼修正
     if chip_change < -1.0:
         scenarios["開高走低"] += 8
         scenarios["開低走低"] += 10
@@ -937,7 +927,6 @@ def build_next_day_scenarios(df, stage, chip_change=0.0, us_bias="中性"):
         scenarios["開低走高"] += 4
         scenarios["開低走低"] -= 4
 
-    # 美股偏向修正
     if us_bias == "偏多":
         scenarios["開高走高"] += 5
         scenarios["開低走高"] += 3
@@ -1180,6 +1169,77 @@ def fetch_live_quote(symbol):
         return None
     return fugle_quote(symbol, api_key)
 
+
+# =========================
+# 盤中獨立模式：即時結構計算
+# =========================
+def build_intraday_independent_levels(price, open_price, high, low, ref_price, direction="多"):
+    price = safe_float(price)
+    open_price = safe_float(open_price)
+    high = safe_float(high)
+    low = safe_float(low)
+    ref_price = safe_float(ref_price)
+
+    range_now = max(high - low, 0.01)
+    pivot = round((high + low + price) / 3, 2)
+
+    if direction == "多":
+        # 盤中獨立模式：不依賴盤後，直接用早盤高低與現價做規劃
+        support1 = round(max(low, min(open_price, price)), 2)
+        support2 = round(low, 2)
+
+        pressure1 = round(max(pivot, price + range_now * 0.25), 2)
+        pressure2 = round(max(high, pressure1 + range_now * 0.35), 2)
+        strong_pressure = round(max(high, pressure2 + range_now * 0.25), 2)
+
+        # 進場價不是直接寫高點，而是給「可重新轉強的確認區」
+        entry_price = round(max(price, support1 + range_now * 0.3), 2)
+        stop_loss = round(support2, 2)
+        tp1 = pressure1
+        tp2 = pressure2
+
+        # 動態狀態
+        if high > ref_price and price > open_price and price >= support1:
+            status = f"盤中獨立模式：屬強勢震盪結構，但須等重新站穩確認位後再偏多操作。(更新時間: {now_hhmm()})"
+        elif price < open_price and price <= support1:
+            status = f"盤中獨立模式：早盤轉弱，先以防守為主。(更新時間: {now_hhmm()})"
+        else:
+            status = f"盤中獨立模式：高檔震盪中，暫不宜追價。(更新時間: {now_hhmm()})"
+
+    else:
+        pressure1 = round(max(high, price), 2)
+        pressure2 = round(pressure1 + range_now * 0.3, 2)
+        support1 = round(min(low, price - range_now * 0.25), 2)
+        support2 = round(low, 2)
+
+        entry_price = support1
+        stop_loss = round(pressure1, 2)
+        tp1 = round(support1 - range_now * 0.3, 2)
+        tp2 = round(support1 - range_now * 0.6, 2)
+
+        if price < open_price and price < ref_price:
+            status = f"盤中獨立模式：空方偏強，可留意跌破支撐後的續弱訊號。(更新時間: {now_hhmm()})"
+        else:
+            status = f"盤中獨立模式：尚未形成明確空方結構。(更新時間: {now_hhmm()})"
+
+    return {
+        "mode": "盤中獨立模式",
+        "pressure1": pressure1,
+        "pressure2": pressure2,
+        "strong_pressure": strong_pressure if direction == "多" else pressure2,
+        "support1": support1,
+        "support2": support2,
+        "entry_price": entry_price,
+        "stop_loss": stop_loss,
+        "tp1": tp1,
+        "tp2": tp2,
+        "status": status
+    }
+
+
+# =========================
+# 盤中承接模式：沿用盤後基準
+# =========================
 def build_intraday_plan(price, open_price, high, low, ref_price, pressure, support, direction="多"):
     if direction == "多":
         entry_price = round(pressure, 2)
@@ -1187,17 +1247,16 @@ def build_intraday_plan(price, open_price, high, low, ref_price, pressure, suppo
         tp1 = round(pressure + (pressure - support) * 0.5, 2)
         tp2 = round(pressure + (pressure - support) * 1.0, 2)
 
-        # 不宜追價條件
         chase_gap = ((price - entry_price) / entry_price * 100) if entry_price != 0 else 0
 
         if price > pressure and price >= open_price and price >= ref_price and chase_gap <= 1.5:
-            status = f"已突破壓力，可依紀律追蹤 (更新時間: {now_hhmm()})"
+            status = f"盤後承接模式：已突破壓力，可依紀律追蹤。(更新時間: {now_hhmm()})"
         elif price > pressure and chase_gap > 1.5:
-            status = f"已突破但乖離偏大，不宜追價 (更新時間: {now_hhmm()})"
+            status = f"盤後承接模式：已突破但乖離偏大，不宜追價。(更新時間: {now_hhmm()})"
         elif high > pressure and price < pressure:
-            status = f"盤中假突破，需防回落 (更新時間: {now_hhmm()})"
+            status = f"盤後承接模式：盤中假突破，需防回落。(更新時間: {now_hhmm()})"
         else:
-            status = f"尚未突破壓力 (更新時間: {now_hhmm()})"
+            status = f"盤後承接模式：尚未突破壓力。(更新時間: {now_hhmm()})"
 
     else:
         entry_price = round(support, 2)
@@ -1206,13 +1265,14 @@ def build_intraday_plan(price, open_price, high, low, ref_price, pressure, suppo
         tp2 = round(support - (pressure - support) * 1.0, 2)
 
         if price < support and price <= open_price and price <= ref_price:
-            status = f"已跌破支撐，空方延續 (更新時間: {now_hhmm()})"
+            status = f"盤後承接模式：已跌破支撐，空方延續。(更新時間: {now_hhmm()})"
         elif low < support and price > support:
-            status = f"盤中假跌破，空方追擊風險高 (更新時間: {now_hhmm()})"
+            status = f"盤後承接模式：盤中假跌破，空方追擊風險高。(更新時間: {now_hhmm()})"
         else:
-            status = f"尚未跌破支撐 (更新時間: {now_hhmm()})"
+            status = f"盤後承接模式：尚未跌破支撐。(更新時間: {now_hhmm()})"
 
     return {
+        "mode": "盤後承接模式",
         "entry_price": entry_price,
         "stop_loss": stop_loss,
         "tp1": tp1,
@@ -1376,22 +1436,23 @@ with tab2:
     st.title("盤中判斷")
 
     after_data = st.session_state.after_result
+
     default_stock = after_data["stock"] if after_data else "4906"
     default_name = after_data["stock_name"] if after_data else ""
-    default_market = after_data["market"] if after_data else "台股"
+    default_market = after_data["market"] if after_data else market_label("4906")
     default_cost = after_data["cost"] if after_data else ""
     default_direction = after_data["direction"] if after_data else "多"
-    default_pressure = float(after_data["pressure1"]) if after_data else 42.0
-    default_support = float(after_data["support1"]) if after_data else 39.0
+    default_pressure = float(after_data["pressure1"]) if after_data else None
+    default_support = float(after_data["support1"]) if after_data else None
     default_fundamental = after_data["auto_fundamental"] if after_data else build_auto_fundamental_summary(default_stock)
     default_stage = after_data["stage"] if after_data else "-"
     default_stage_name = after_data["stage_name"] if after_data else "未判斷"
-    default_stage_desc = after_data["stage_desc"] if after_data else f"請先進行盤後分析。(更新時間: {now_hhmm()})"
-    default_favorable = after_data["favorable_zone"] if after_data else "未知"
+    default_stage_desc = after_data["stage_desc"] if after_data else f"未偵測到盤後分析結果，系統將改用盤中獨立模式。(更新時間: {now_hhmm()})"
+    default_favorable = after_data["favorable_zone"] if after_data else "盤中獨立判斷"
     default_chip_warning = after_data["chip_warning"] if after_data else False
-    default_comment = after_data["comment"] if after_data else f"請先進行盤後分析。(更新時間: {now_hhmm()})"
+    default_comment = after_data["comment"] if after_data else f"未偵測到盤後分析結果，系統已切換為盤中獨立判斷模式。(更新時間: {now_hhmm()})"
     default_us_block = after_data["us_block"] if after_data else build_us_correlation_block(default_stock)
-    default_main_scenario = after_data["scenario_info"]["main_scenario"] if after_data else "未知"
+    default_main_scenario = after_data["scenario_info"]["main_scenario"] if after_data else "盤中獨立模式"
     default_risk_level = after_data["risk_level"] if after_data else "未知"
     default_market_label = after_data["market_label"] if after_data else market_label(default_stock)
 
@@ -1401,8 +1462,15 @@ with tab2:
         market_i = st.text_input("市場別", value=default_market).strip()
         cost_i = st.text_input("買進或放空成本", value=default_cost)
         direction_i = st.selectbox("操作方向", ["多", "空"], index=0 if default_direction == "多" else 1)
-        pressure_i = st.number_input("壓力", value=default_pressure, step=0.1, format="%.2f")
-        support_i = st.number_input("支撐", value=default_support, step=0.1, format="%.2f")
+
+        if after_data:
+            pressure_i = st.number_input("壓力", value=default_pressure, step=0.1, format="%.2f")
+            support_i = st.number_input("支撐", value=default_support, step=0.1, format="%.2f")
+        else:
+            st.caption("未偵測到盤後分析結果，將使用盤中獨立模式自動計算關鍵價位。")
+            pressure_i = None
+            support_i = None
+
         submitted_intra = st.form_submit_button("更新盤中判斷")
 
     if submitted_intra:
@@ -1411,22 +1479,38 @@ with tab2:
         if not data:
             st.error("抓不到盤中資料，請確認股票代號、網路來源或目前是否有行情")
         else:
-            plan = build_intraday_plan(
-                price=safe_float(data.get("lastPrice", 0)),
-                open_price=safe_float(data.get("openPrice", 0)),
-                high=safe_float(data.get("highPrice", 0)),
-                low=safe_float(data.get("lowPrice", 0)),
-                ref_price=safe_float(data.get("referencePrice", 0)),
-                pressure=float(pressure_i),
-                support=float(support_i),
-                direction=direction_i
-            )
+            # 雙模式切換
+            if after_data and pressure_i is not None and support_i is not None:
+                plan = build_intraday_plan(
+                    price=safe_float(data.get("lastPrice", 0)),
+                    open_price=safe_float(data.get("openPrice", 0)),
+                    high=safe_float(data.get("highPrice", 0)),
+                    low=safe_float(data.get("lowPrice", 0)),
+                    ref_price=safe_float(data.get("referencePrice", 0)),
+                    pressure=float(pressure_i),
+                    support=float(support_i),
+                    direction=direction_i
+                )
+                current_mode = "盤後承接模式"
+            else:
+                plan = build_intraday_independent_levels(
+                    price=safe_float(data.get("lastPrice", 0)),
+                    open_price=safe_float(data.get("openPrice", 0)),
+                    high=safe_float(data.get("highPrice", 0)),
+                    low=safe_float(data.get("lowPrice", 0)),
+                    ref_price=safe_float(data.get("referencePrice", 0)),
+                    direction=direction_i
+                )
+                current_mode = "盤中獨立模式"
 
             st.subheader("交易員判讀結論")
             st.markdown(f"### {default_comment}")
 
+            st.subheader("目前模式")
+            st.write(f"{current_mode} (更新時間: {now_hhmm()})")
+
             st.subheader("市場別")
-            st.write(f"{default_market_label} (更新時間: {now_hhmm()})")
+            st.write(f"{default_market_label if market_i == default_market else market_label(stock_i)} (更新時間: {now_hhmm()})")
 
             st.subheader("風險燈號")
             risk_color = "#16a34a" if default_risk_level == "低" else "#d97706" if default_risk_level == "中" else "#dc2626"
@@ -1497,6 +1581,15 @@ with tab2:
             d3.metric("第一賣出價", fmt_num(plan["tp1"]))
             d4.metric("第二賣出價", fmt_num(plan["tp2"]))
             st.caption(f"更新時間: {now_hhmm()}")
+
+            # 獨立模式補充顯示
+            if current_mode == "盤中獨立模式":
+                st.subheader("盤中獨立模式參考區間")
+                x1, x2, x3 = st.columns(3)
+                x1.metric("短壓", fmt_num(plan["pressure1"]))
+                x2.metric("強壓", fmt_num(plan["pressure2"]))
+                x3.metric("防守支撐", fmt_num(plan["support1"]))
+                st.caption(f"更新時間: {now_hhmm()}")
 
             st.subheader("盤中狀態")
             st.write(plan["status"])
