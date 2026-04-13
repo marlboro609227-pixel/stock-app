@@ -65,6 +65,12 @@ def is_us_symbol(symbol: str) -> bool:
 def market_label(symbol: str) -> str:
     return "美股" if is_us_symbol(symbol) else "台股"
 
+def get_secret(name: str, default: str = "") -> str:
+    try:
+        return str(st.secrets[name])
+    except Exception:
+        return default
+
 
 # =========================
 # 側邊欄：專業作戰時程表
@@ -216,7 +222,7 @@ def fetch_finmind_dataset(dataset, data_id="", start_date="2023-01-01"):
 
 
 # =========================
-# 台股資料
+# 台股 / 美股 基本資料
 # =========================
 @st.cache_data(ttl=3600)
 def fetch_stock_info(stock_id):
@@ -244,6 +250,7 @@ def fetch_stock_info(stock_id):
         "type": str(row.get("type", ""))
     }
 
+
 @st.cache_data(ttl=3600)
 def fetch_month_revenue(stock_id):
     if is_us_symbol(stock_id):
@@ -263,35 +270,47 @@ def fetch_month_revenue(stock_id):
 
 
 # =========================
-# 價格資料：台股 / 美股雙市場
+# yfinance 日線整理
 # =========================
-def _normalize_yfinance_close(df):
-    if df is None or len(df) == 0:
+def _normalize_yf_frame(df):
+    if df is None or df.empty:
         return None
 
-    if "Close" in df.columns:
-        close_obj = df["Close"]
-    else:
-        close_obj = None
-        if isinstance(df.columns, pd.MultiIndex):
-            for col in df.columns:
-                if str(col[-1]) == "Close":
-                    close_obj = df[col]
-                    break
+    if isinstance(df.columns, pd.MultiIndex):
+        out = pd.DataFrame(index=df.index)
+        mapping = {
+            "Open": "open",
+            "Close": "close",
+            "High": "max",
+            "Low": "min",
+            "Volume": "Trading_Volume"
+        }
+        for src, dst in mapping.items():
+            try:
+                obj = df[src]
+                out[dst] = pd.to_numeric(obj.iloc[:, 0] if isinstance(obj, pd.DataFrame) else obj, errors="coerce")
+            except Exception:
+                return None
+        out["date"] = df.index
+        return out.reset_index(drop=True)
 
-    if close_obj is None:
-        return None
+    mapping = {
+        "Open": "open",
+        "Close": "close",
+        "High": "max",
+        "Low": "min",
+        "Volume": "Trading_Volume"
+    }
 
-    if isinstance(close_obj, pd.DataFrame):
-        if close_obj.shape[1] == 0:
+    for c in mapping:
+        if c not in df.columns:
             return None
-        close_obj = close_obj.iloc[:, 0]
 
-    close_series = pd.to_numeric(close_obj, errors="coerce").dropna()
-    if len(close_series) < 2:
-        return None
+    out = df.rename(columns=mapping).reset_index()
+    if "Date" in out.columns:
+        out = out.rename(columns={"Date": "date"})
+    return out
 
-    return close_series
 
 @st.cache_data(ttl=1800)
 def fetch_us_daily_data(symbol, period="6mo"):
@@ -307,63 +326,26 @@ def fetch_us_daily_data(symbol, period="6mo"):
     except Exception:
         return None
 
-    if df is None or df.empty:
+    out = _normalize_yf_frame(df)
+    if out is None:
         return None
-
-    if isinstance(df.columns, pd.MultiIndex):
-        new_df = pd.DataFrame()
-        for field, target_name in [
-            ("Open", "open"),
-            ("Close", "close"),
-            ("High", "max"),
-            ("Low", "min"),
-            ("Volume", "Trading_Volume")
-        ]:
-            try:
-                obj = df[field]
-                if isinstance(obj, pd.DataFrame):
-                    new_df[target_name] = pd.to_numeric(obj.iloc[:, 0], errors="coerce")
-                else:
-                    new_df[target_name] = pd.to_numeric(obj, errors="coerce")
-            except Exception:
-                return None
-        new_df["date"] = df.index
-        df2 = new_df.copy()
-    else:
-        rename_map = {
-            "Open": "open",
-            "Close": "close",
-            "High": "max",
-            "Low": "min",
-            "Volume": "Trading_Volume"
-        }
-        missing = [k for k in rename_map if k not in df.columns]
-        if missing:
-            return None
-        df2 = df.rename(columns=rename_map).reset_index()
-        if "Date" in df2.columns:
-            df2 = df2.rename(columns={"Date": "date"})
-
-    required = ["date", "open", "close", "max", "min", "Trading_Volume"]
-    for c in required:
-        if c not in df2.columns:
-            return None
 
     for c in ["open", "close", "max", "min", "Trading_Volume"]:
-        df2[c] = pd.to_numeric(df2[c], errors="coerce")
+        out[c] = pd.to_numeric(out[c], errors="coerce")
 
-    df2 = df2.dropna(subset=["open", "close", "max", "min", "Trading_Volume"]).reset_index(drop=True)
-    if len(df2) < 40:
+    out = out.dropna(subset=["open", "close", "max", "min", "Trading_Volume"]).reset_index(drop=True)
+    if len(out) < 20:
         return None
-    return df2
+    return out
+
 
 @st.cache_data(ttl=3600)
 def fetch_daily_data(stock_id, start_date="2023-01-01"):
     if is_us_symbol(stock_id):
-        return fetch_us_daily_data(stock_id, period="6mo")
+        return fetch_us_daily_data(stock_id)
 
     df = fetch_finmind_dataset("TaiwanStockPrice", data_id=stock_id, start_date=start_date)
-    if df is None or df.empty or len(df) < 40:
+    if df is None or df.empty:
         return None
 
     required = ["date", "open", "close", "max", "min", "Trading_Volume"]
@@ -372,12 +354,15 @@ def fetch_daily_data(stock_id, start_date="2023-01-01"):
             return None
 
     df = df.sort_values("date").reset_index(drop=True)
+
     for c in ["open", "close", "max", "min", "Trading_Volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
     df = df.dropna(subset=["open", "close", "max", "min", "Trading_Volume"]).reset_index(drop=True)
-    if len(df) < 40:
+
+    if len(df) < 10:
         return None
+
     return df
 
 
@@ -388,11 +373,10 @@ def build_auto_fundamental_summary(stock_id):
     if is_us_symbol(stock_id):
         info = fetch_stock_info(stock_id)
         name = info.get("stock_name", stock_id.upper()) if info else stock_id.upper()
-        return f"{name}目前以美股價格與技術結構為主進行判讀，基本面摘要建議搭配公司財報、指引與產業趨勢另行交叉比對。(更新時間: {now_hhmm()})"
+        return f"{name}目前以美股價格與技術結構為主進行判讀，基本面摘要建議搭配公司財報、財測與產業趨勢另行交叉比對。(更新時間: {now_hhmm()})"
 
     info = fetch_stock_info(stock_id)
     rev_data = fetch_month_revenue(stock_id)
-
     parts = []
 
     if info:
@@ -412,7 +396,7 @@ def build_auto_fundamental_summary(stock_id):
         if y and m and revenue is not None:
             parts.append(f"最新月營收資料為{y}年{m}月，單月營收約{volume_to_human(revenue)}元")
 
-        if prev and latest.get("revenue", None) is not None and prev.get("revenue", None) is not None:
+        if prev and latest.get("revenue") is not None and prev.get("revenue") is not None:
             try:
                 mom = (float(latest["revenue"]) - float(prev["revenue"])) / float(prev["revenue"]) * 100
                 if mom > 0:
@@ -431,22 +415,19 @@ def build_auto_fundamental_summary(stock_id):
 
 
 # =========================
-# 美股連動 / 美股偏向
+# 美股連動
 # =========================
-def map_us_indices(industry_category: str):
+def map_us_indices(industry_category):
     text = (industry_category or "").strip()
 
-    semi_keywords = ["半導體", "電子", "通訊"]
-    cyc_keywords = ["金融", "鋼鐵", "塑膠", "水泥"]
-    growth_keywords = ["AI", "雲端", "軟體", "生技", "醫療", "網通"]
-
-    if any(k in text for k in semi_keywords):
+    if any(k in text for k in ["半導體", "電子", "通訊"]):
         return ["^SOX", "^IXIC"], "費半 / 那指"
-    if any(k in text for k in cyc_keywords):
+    if any(k in text for k in ["金融", "鋼鐵", "塑膠", "水泥"]):
         return ["^DJI"], "道瓊"
-    if any(k in text for k in growth_keywords):
+    if any(k in text for k in ["AI", "雲端", "軟體", "生技", "醫療", "網通"]):
         return ["^IXIC"], "那指"
     return ["^IXIC"], "那指"
+
 
 @st.cache_data(ttl=3600)
 def fetch_us_index_change(ticker):
@@ -462,16 +443,23 @@ def fetch_us_index_change(ticker):
     except Exception:
         return None
 
-    close_series = _normalize_yfinance_close(df)
-    if close_series is None:
+    if df is None or df.empty:
         return None
 
     try:
-        latest = float(close_series.iloc[-1])
-        prev = float(close_series.iloc[-2])
+        if isinstance(df.columns, pd.MultiIndex):
+            close_obj = df["Close"]
+            close = pd.to_numeric(close_obj.iloc[:, 0] if isinstance(close_obj, pd.DataFrame) else close_obj, errors="coerce").dropna()
+        else:
+            close = pd.to_numeric(df["Close"], errors="coerce").dropna()
     except Exception:
         return None
 
+    if len(close) < 2:
+        return None
+
+    latest = float(close.iloc[-1])
+    prev = float(close.iloc[-2])
     if prev == 0:
         return None
 
@@ -483,32 +471,33 @@ def fetch_us_index_change(ticker):
         "change_pct": round(pct, 2)
     }
 
+
 def summarize_us_bias(indices):
     if not indices:
         return "中性"
 
-    avg_pct = float(np.mean([x["change_pct"] for x in indices]))
+    avg_pct = float(np.mean([i["change_pct"] for i in indices]))
     if avg_pct > 0.8:
         return "偏多"
     if avg_pct < -0.8:
         return "偏空"
     return "中性"
 
+
 def build_us_correlation_block(stock_id):
     info = fetch_stock_info(stock_id)
     industry = info["industry_category"] if info else ""
 
     if is_us_symbol(stock_id):
-        tickers = ["^IXIC", "^GSPC"]
-        label = "Nasdaq / S&P 500"
+        tickers, label = ["^IXIC", "^GSPC"], "Nasdaq / S&P 500"
     else:
         tickers, label = map_us_indices(industry)
 
     data = []
     for t in tickers:
-        res = fetch_us_index_change(t)
-        if res:
-            data.append(res)
+        item = fetch_us_index_change(t)
+        if item:
+            data.append(item)
 
     return {
         "industry": industry,
@@ -516,9 +505,7 @@ def build_us_correlation_block(stock_id):
         "indices": data,
         "bias": summarize_us_bias(data)
     }
-
-
-# =========================
+    # =========================
 # 籌碼：400張以上大戶持股比例
 # =========================
 @st.cache_data(ttl=3600)
@@ -575,6 +562,7 @@ def fetch_400_holder_ratio(stock_id):
 
     grouped = grouped.rename(columns={percent_col: "holder_400_ratio"})
     return grouped
+
 
 def check_400_holder_change(stock_id):
     if is_us_symbol(stock_id):
@@ -645,6 +633,7 @@ def valid_row(row):
         return False
     return True
 
+
 def score_today(df):
     t = df.iloc[-1]
     p = df.iloc[-2]
@@ -675,6 +664,7 @@ def score_today(df):
         score += 20
 
     return int(score)
+
 
 def backtest_strategy(df):
     returns = []
@@ -715,6 +705,7 @@ def backtest_strategy(df):
         "trades": len(returns)
     }
 
+
 def build_after_levels(close_price, high_price, low_price, direction="多", stage="③"):
     range_val = max(high_price - low_price, 0.01)
 
@@ -726,6 +717,7 @@ def build_after_levels(close_price, high_price, low_price, direction="多", stag
             pressure2 = round(high_price + range_val * 0.4, 2)
         else:
             pressure2 = round(high_price + range_val * 0.25, 2)
+
         support1 = round(low_price, 2)
 
         if stage == "⑥":
@@ -961,9 +953,7 @@ def build_next_day_scenarios(df, stage, chip_change=0.0, us_bias="中性"):
         "main_scenario": main_name,
         "response_note": response_map[main_name]
     }
-
-
-# =========================
+    # =========================
 # 交易員一句話結論
 # =========================
 def build_trader_comment(stage, chip_warning, main_scenario, us_bias="中性"):
@@ -1018,6 +1008,104 @@ def build_favorable_zone(stage, main_scenario, chip_warning):
 
 
 # =========================
+# 勝率 AI 模型
+# =========================
+def ai_winrate_model(df, stage, chip_warning, us_block):
+    score = 50
+
+    if df is None or len(df) < 20:
+        return 50, "資料不足"
+
+    d = df.copy().reset_index(drop=True)
+    t = d.iloc[-1]
+    p = d.iloc[-2]
+
+    close = float(t["close"])
+    open_p = float(t["open"])
+    high = float(t["max"])
+    low = float(t["min"])
+    prev_close = float(p["close"])
+
+    if close > open_p:
+        score += 5
+    else:
+        score -= 5
+
+    pos = (close - low) / (high - low + 1e-6)
+    if pos > 0.7:
+        score += 8
+    elif pos < 0.3:
+        score -= 8
+
+    change = (close - prev_close) / prev_close * 100 if prev_close != 0 else 0
+    if change > 2:
+        score += 6
+    elif change < -2:
+        score -= 6
+
+    vol_ma5 = d["Trading_Volume"].rolling(5).mean().iloc[-1]
+    if pd.notna(vol_ma5) and vol_ma5 != 0:
+        vol_ratio = float(t["Trading_Volume"]) / float(vol_ma5)
+        if vol_ratio > 1.2:
+            score += 6
+        elif vol_ratio < 0.8:
+            score -= 4
+
+    if stage in ["③", "④"]:
+        score += 10
+    elif stage == "⑤":
+        score -= 5
+    elif stage == "⑥":
+        score -= 12
+    elif stage == "①":
+        score -= 8
+
+    if chip_warning:
+        score -= 15
+    else:
+        score += 5
+
+    if us_block and us_block["indices"]:
+        for idx in us_block["indices"]:
+            pct = idx.get("change_pct", 0)
+            if pct > 1:
+                score += 5
+            elif pct < -1:
+                score -= 5
+
+    score = max(5, min(95, int(score)))
+
+    if score >= 70:
+        risk = "低風險（偏多）"
+    elif score >= 55:
+        risk = "中性偏多"
+    elif score >= 45:
+        risk = "震盪"
+    elif score >= 30:
+        risk = "偏空風險"
+    else:
+        risk = "高風險（不建議交易）"
+
+    return score, risk
+
+
+def ai_final_decision(winrate, stage, main_scenario, chip_warning):
+    if chip_warning and stage in ["⑤", "⑥"]:
+        return "❌ 主力出貨中，不可進場"
+
+    if winrate >= 70:
+        return "✅ 可積極操作（順勢）"
+
+    if winrate >= 55:
+        return "⚠️ 可小倉操作"
+
+    if winrate >= 45:
+        return "⚖️ 觀望為主"
+
+    return "🚫 不建議進場"
+
+
+# =========================
 # 盤後分析主函式
 # =========================
 def analyze_after_stock(stock_id, direction="多"):
@@ -1032,7 +1120,6 @@ def analyze_after_stock(stock_id, direction="多"):
     backtest_result = backtest_strategy(df)
 
     t = df.iloc[-1]
-
     close_price = round(float(t["close"]), 2)
     high_price = round(float(t["max"]), 2)
     low_price = round(float(t["min"]), 2)
@@ -1069,7 +1156,27 @@ def analyze_after_stock(stock_id, direction="多"):
         us_bias=us_block["bias"]
     )
 
-    risk_level = "高" if favorable_zone in ["🔴 警戒：主力出貨中", "❌ 否（風險極高）", "否（高檔拉回風險升高）"] else "中" if favorable_zone in ["有限有利（末段攻擊）", "觀察"] else "低"
+    winrate_ai, risk_ai = ai_winrate_model(
+        df,
+        stage_info["stage"],
+        stage_info["chip_warning"],
+        us_block
+    )
+
+    final_ai_decision = ai_final_decision(
+        winrate_ai,
+        stage_info["stage"],
+        scenario_info["main_scenario"],
+        stage_info["chip_warning"]
+    )
+
+    risk_level = (
+        "高"
+        if favorable_zone in ["🔴 警戒：主力出貨中", "❌ 否（風險極高）", "否（高檔拉回風險升高）"]
+        else "中"
+        if favorable_zone in ["有限有利（末段攻擊）", "觀察"]
+        else "低"
+    )
 
     return {
         "stock": stock_id,
@@ -1093,7 +1200,10 @@ def analyze_after_stock(stock_id, direction="多"):
         "scenario_info": scenario_info,
         "us_block": us_block,
         "risk_level": risk_level,
-        "market_label": market_label(stock_id)
+        "market_label": market_label(stock_id),
+        "winrate_ai": winrate_ai,
+        "risk_ai": risk_ai,
+        "final_ai_decision": final_ai_decision
     }
 
 
@@ -1111,10 +1221,12 @@ def fugle_quote(symbol, api_key):
     except Exception:
         return None
 
+
 def fetch_us_intraday_quote(symbol):
     try:
         ticker = yf.Ticker(symbol.upper())
         hist = ticker.history(period="2d", interval="1m")
+
         if hist is None or hist.empty:
             hist = ticker.history(period="5d", interval="1d")
             if hist is None or hist.empty:
@@ -1138,11 +1250,10 @@ def fetch_us_intraday_quote(symbol):
                 "changePercent": round(change_pct, 2)
             }
 
-        today_df = hist.copy()
-        last_row = today_df.iloc[-1]
-        open_price = float(today_df["Open"].iloc[0])
-        high_price = float(today_df["High"].max())
-        low_price = float(today_df["Low"].min())
+        last_row = hist.iloc[-1]
+        open_price = float(hist["Open"].iloc[0])
+        high_price = float(hist["High"].max())
+        low_price = float(hist["Low"].min())
         last_price = float(last_row["Close"])
 
         daily = ticker.history(period="5d", interval="1d")
@@ -1160,13 +1271,15 @@ def fetch_us_intraday_quote(symbol):
     except Exception:
         return None
 
+
 def fetch_live_quote(symbol):
     if is_us_symbol(symbol):
         return fetch_us_intraday_quote(symbol)
 
-    api_key = st.secrets.get("FUGLE_API_KEY", "")
+    api_key = get_secret("FUGLE_API_KEY", "")
     if not api_key:
         return None
+
     return fugle_quote(symbol, api_key)
 
 
@@ -1184,7 +1297,6 @@ def build_intraday_independent_levels(price, open_price, high, low, ref_price, d
     pivot = round((high + low + price) / 3, 2)
 
     if direction == "多":
-        # 盤中獨立模式：不依賴盤後，直接用早盤高低與現價做規劃
         support1 = round(max(low, min(open_price, price)), 2)
         support2 = round(low, 2)
 
@@ -1192,13 +1304,11 @@ def build_intraday_independent_levels(price, open_price, high, low, ref_price, d
         pressure2 = round(max(high, pressure1 + range_now * 0.35), 2)
         strong_pressure = round(max(high, pressure2 + range_now * 0.25), 2)
 
-        # 進場價不是直接寫高點，而是給「可重新轉強的確認區」
         entry_price = round(max(price, support1 + range_now * 0.3), 2)
         stop_loss = round(support2, 2)
         tp1 = pressure1
         tp2 = pressure2
 
-        # 動態狀態
         if high > ref_price and price > open_price and price >= support1:
             status = f"盤中獨立模式：屬強勢震盪結構，但須等重新站穩確認位後再偏多操作。(更新時間: {now_hhmm()})"
         elif price < open_price and price <= support1:
@@ -1209,6 +1319,7 @@ def build_intraday_independent_levels(price, open_price, high, low, ref_price, d
     else:
         pressure1 = round(max(high, price), 2)
         pressure2 = round(pressure1 + range_now * 0.3, 2)
+        strong_pressure = pressure2
         support1 = round(min(low, price - range_now * 0.25), 2)
         support2 = round(low, 2)
 
@@ -1226,7 +1337,7 @@ def build_intraday_independent_levels(price, open_price, high, low, ref_price, d
         "mode": "盤中獨立模式",
         "pressure1": pressure1,
         "pressure2": pressure2,
-        "strong_pressure": strong_pressure if direction == "多" else pressure2,
+        "strong_pressure": strong_pressure,
         "support1": support1,
         "support2": support2,
         "entry_price": entry_price,
@@ -1278,6 +1389,88 @@ def build_intraday_plan(price, open_price, high, low, ref_price, pressure, suppo
         "tp1": tp1,
         "tp2": tp2,
         "status": status
+    }
+
+
+# =========================
+# 盤中 AI 決策 / 自動交易
+# =========================
+def dynamic_intraday_levels(data, base_pressure, base_support):
+    price = safe_float(data.get("lastPrice"))
+    high = safe_float(data.get("highPrice"))
+    low = safe_float(data.get("lowPrice"))
+
+    new_pressure = max(base_pressure, high)
+    new_support = min(base_support, low)
+
+    return {
+        "pressure": round(new_pressure, 2),
+        "support": round(new_support, 2),
+        "mid": round((new_pressure + new_support) / 2, 2)
+    }
+
+
+def intraday_ai_decision(data, pressure, support):
+    price = safe_float(data.get("lastPrice"))
+    open_p = safe_float(data.get("openPrice"))
+    high = safe_float(data.get("highPrice"))
+    low = safe_float(data.get("lowPrice"))
+    ref = safe_float(data.get("referencePrice"))
+
+    decision = ""
+    strength = ""
+    action = ""
+
+    if price > pressure:
+        if price > open_p and price > ref:
+            decision = "有效突破"
+            strength = "多方強勢"
+            action = "可順勢做多"
+        else:
+            decision = "假突破"
+            strength = "誘多"
+            action = "禁止追價"
+    elif price < support:
+        decision = "跌破支撐"
+        strength = "空方轉強"
+        action = "避免做多"
+    elif high >= pressure * 0.98:
+        decision = "高檔震盪"
+        strength = "動能不足"
+        action = "不追 / 逢高減碼"
+    elif low <= support:
+        decision = "支撐反彈"
+        strength = "短線止跌"
+        action = "可小倉試單"
+    else:
+        decision = "盤整"
+        strength = "方向不明"
+        action = "觀望"
+
+    return {
+        "decision": decision,
+        "strength": strength,
+        "action": action
+    }
+
+
+def generate_trade_plan(pressure, support, direction="多"):
+    if direction == "多":
+        entry = pressure
+        stop = support
+        tp1 = round(pressure + (pressure - support) * 0.5, 2)
+        tp2 = round(pressure + (pressure - support) * 1.0, 2)
+    else:
+        entry = support
+        stop = pressure
+        tp1 = round(support - (pressure - support) * 0.5, 2)
+        tp2 = round(support - (pressure - support) * 1.0, 2)
+
+    return {
+        "entry": round(entry, 2),
+        "stop": round(stop, 2),
+        "tp1": tp1,
+        "tp2": tp2
     }
 
 
@@ -1338,8 +1531,19 @@ with tab1:
                 "scenario_info": res["scenario_info"],
                 "us_block": us_block,
                 "risk_level": res["risk_level"],
-                "market_label": res["market_label"]
+                "market_label": res["market_label"],
+                "winrate_ai": res["winrate_ai"],
+                "risk_ai": res["risk_ai"],
+                "final_ai_decision": res["final_ai_decision"]
             }
+
+            st.subheader("AI勝率分析")
+            c1, c2 = st.columns(2)
+            c1.metric("今日勝率", f"{res['winrate_ai']}%")
+            c2.metric("風險等級", res["risk_ai"])
+
+            st.subheader("AI最終決策")
+            st.markdown(f"### {res['final_ai_decision']}")
 
             st.subheader("交易員判讀結論")
             st.markdown(f"### {res['comment']}")
@@ -1455,6 +1659,9 @@ with tab2:
     default_main_scenario = after_data["scenario_info"]["main_scenario"] if after_data else "盤中獨立模式"
     default_risk_level = after_data["risk_level"] if after_data else "未知"
     default_market_label = after_data["market_label"] if after_data else market_label(default_stock)
+    default_winrate_ai = after_data["winrate_ai"] if after_data else 50
+    default_risk_ai = after_data["risk_ai"] if after_data else "資料不足"
+    default_final_ai_decision = after_data["final_ai_decision"] if after_data else "⚖️ 觀望為主"
 
     with st.form("intra_form"):
         stock_i = st.text_input("股票代號", value=default_stock).strip()
@@ -1479,19 +1686,23 @@ with tab2:
         if not data:
             st.error("抓不到盤中資料，請確認股票代號、網路來源或目前是否有行情")
         else:
-            # 雙模式切換
             if after_data and pressure_i is not None and support_i is not None:
+                dyn = dynamic_intraday_levels(data, pressure_i, support_i)
                 plan = build_intraday_plan(
                     price=safe_float(data.get("lastPrice", 0)),
                     open_price=safe_float(data.get("openPrice", 0)),
                     high=safe_float(data.get("highPrice", 0)),
                     low=safe_float(data.get("lowPrice", 0)),
                     ref_price=safe_float(data.get("referencePrice", 0)),
-                    pressure=float(pressure_i),
-                    support=float(support_i),
+                    pressure=float(dyn["pressure"]),
+                    support=float(dyn["support"]),
                     direction=direction_i
                 )
+                ai = intraday_ai_decision(data, dyn["pressure"], dyn["support"])
+                trade = generate_trade_plan(dyn["pressure"], dyn["support"], direction_i)
                 current_mode = "盤後承接模式"
+                show_pressure = dyn["pressure"]
+                show_support = dyn["support"]
             else:
                 plan = build_intraday_independent_levels(
                     price=safe_float(data.get("lastPrice", 0)),
@@ -1501,7 +1712,19 @@ with tab2:
                     ref_price=safe_float(data.get("referencePrice", 0)),
                     direction=direction_i
                 )
+                ai = intraday_ai_decision(data, plan["pressure1"], plan["support1"])
+                trade = generate_trade_plan(plan["pressure1"], plan["support1"], direction_i)
                 current_mode = "盤中獨立模式"
+                show_pressure = plan["pressure1"]
+                show_support = plan["support1"]
+
+            st.subheader("AI勝率分析")
+            c1, c2 = st.columns(2)
+            c1.metric("盤前勝率參考", f"{default_winrate_ai}%")
+            c2.metric("風險等級", default_risk_ai)
+
+            st.subheader("AI最終決策")
+            st.markdown(f"### {default_final_ai_decision}")
 
             st.subheader("交易員判讀結論")
             st.markdown(f"### {default_comment}")
@@ -1574,6 +1797,27 @@ with tab2:
             c5.metric("漲跌幅", f"{fmt_num(data.get('changePercent', 0))}%")
             st.caption(f"更新時間: {now_hhmm()}")
 
+            st.subheader("盤中動態結構")
+            x1, x2, x3 = st.columns(3)
+            x1.metric("動態壓力", fmt_num(show_pressure))
+            x2.metric("動態支撐", fmt_num(show_support))
+            x3.metric("模式", current_mode)
+            st.caption(f"更新時間: {now_hhmm()}")
+
+            st.subheader("AI盤中決策")
+            a1, a2, a3 = st.columns(3)
+            a1.metric("判斷", ai["decision"])
+            a2.metric("結構", ai["strength"])
+            a3.metric("行動", ai["action"])
+
+            st.subheader("自動交易計畫")
+            t1, t2, t3, t4 = st.columns(4)
+            t1.metric("進場價", fmt_num(trade["entry"]))
+            t2.metric("停損價", fmt_num(trade["stop"]))
+            t3.metric("第一賣出", fmt_num(trade["tp1"]))
+            t4.metric("第二賣出", fmt_num(trade["tp2"]))
+            st.caption(f"更新時間: {now_hhmm()}")
+
             st.subheader("盤中關鍵價位（09:00-11:00 執行用）")
             d1, d2, d3, d4 = st.columns(4)
             d1.metric("進場價", fmt_num(plan["entry_price"]))
@@ -1582,7 +1826,6 @@ with tab2:
             d4.metric("第二賣出價", fmt_num(plan["tp2"]))
             st.caption(f"更新時間: {now_hhmm()}")
 
-            # 獨立模式補充顯示
             if current_mode == "盤中獨立模式":
                 st.subheader("盤中獨立模式參考區間")
                 x1, x2, x3 = st.columns(3)
@@ -1593,3 +1836,4 @@ with tab2:
 
             st.subheader("盤中狀態")
             st.write(plan["status"])
+            
